@@ -17,14 +17,16 @@ from frigate.util.model import (
     post_process_rfdetr,
     post_process_yolo,
     post_process_yolox,
+    yolo_decode_kwargs,
 )
+from frigate.util.yolo_decode_config import YoloDecodeConfig
 
 logger = logging.getLogger(__name__)
 
 DETECTOR_KEY = "onnx"
 
 
-class ONNXDetectorConfig(BaseDetectorConfig):
+class ONNXDetectorConfig(BaseDetectorConfig, YoloDecodeConfig):
     """ONNX detector for running ONNX models; will use available acceleration backends (CUDA/ROCm/OpenVINO) when available."""
 
     model_config = ConfigDict(
@@ -57,6 +59,15 @@ class ONNXDetector(DetectionApi):
         self.onnx_model_type = detector_config.model.model_type
         self.onnx_model_px = detector_config.model.input_pixel_format
         self.onnx_model_shape = detector_config.model.input_tensor
+        self.yolo_decode = (
+            yolo_decode_kwargs(
+                detector_config,
+                detector_config.model.merged_labelmap,
+                owner=DETECTOR_KEY,
+            )
+            if self.onnx_model_type == ModelTypeEnum.yologeneric
+            else {}
+        )
 
         if self.onnx_model_type == ModelTypeEnum.yolox:
             self.calculate_grids_strides()
@@ -128,7 +139,9 @@ class ONNXDetector(DetectionApi):
                 ]
             return detections
         elif self.onnx_model_type == ModelTypeEnum.yologeneric:
-            return post_process_yolo(tensor_output, self.width, self.height)
+            return post_process_yolo(
+                tensor_output, self.width, self.height, **self.yolo_decode
+            )
         elif self.onnx_model_type == ModelTypeEnum.yolox:
             return post_process_yolox(
                 tensor_output[0],

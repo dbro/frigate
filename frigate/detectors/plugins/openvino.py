@@ -12,14 +12,16 @@ from frigate.util.model import (
     post_process_dfine,
     post_process_rfdetr,
     post_process_yolo,
+    yolo_decode_kwargs,
 )
+from frigate.util.yolo_decode_config import YoloDecodeConfig
 
 logger = logging.getLogger(__name__)
 
 DETECTOR_KEY = "openvino"
 
 
-class OvDetectorConfig(BaseDetectorConfig):
+class OvDetectorConfig(BaseDetectorConfig, YoloDecodeConfig):
     """OpenVINO detector for AMD and Intel CPUs, Intel GPUs and Intel VPU hardware."""
 
     model_config = ConfigDict(
@@ -51,6 +53,15 @@ class OvDetector(DetectionApi):
 
         self.h = detector_config.model.height
         self.w = detector_config.model.width
+        self.yolo_decode = (
+            yolo_decode_kwargs(
+                detector_config,
+                detector_config.model.merged_labelmap,
+                owner=DETECTOR_KEY,
+            )
+            if self.ov_model_type == ModelTypeEnum.yologeneric
+            else {}
+        )
 
         logger.info(
             "Loading OpenVINO model %s on device %s",
@@ -210,7 +221,7 @@ class OvDetector(DetectionApi):
                 ]
             return detections
         elif self.ov_model_type == ModelTypeEnum.yologeneric:
-            return post_process_yolo(outputs, self.w, self.h)
+            return post_process_yolo(outputs, self.w, self.h, **self.yolo_decode)
         elif self.ov_model_type == ModelTypeEnum.yolox:
             # [x, y, h, w, box_score, class_no_1, ..., class_no_80],
             results = outputs[0]

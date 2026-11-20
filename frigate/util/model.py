@@ -130,10 +130,67 @@ def post_process_rfdetr(tensor_output: list[np.ndarray, np.ndarray]) -> np.ndarr
     return detections
 
 
+def build_nms_group_lookup(
+    nms_class_groups: list | None,
+    labelmap: dict[int, str] | None,
+    num_classes: int | None = None,
+) -> np.ndarray | None:
+    """Map class id -> NMS group for post_process_yolo(class_groups=...).
+
+    Group = position in nms_class_groups + 1; unlisted classes are group 0.
+    Returns None when no groups are configured (all classes in one group).
+    Unknown names only log a warning. Build once at startup, not per frame.
+    """
+    if not nms_class_groups:
+        return None
+    labelmap = labelmap or {}
+    if num_classes is None:
+        num_classes = (max(int(k) for k in labelmap) + 1) if labelmap else 0
+    ids_by_name: dict[str, list[int]] = {}
+    for class_id, name in labelmap.items():
+        ids_by_name.setdefault(name, []).append(int(class_id))
+    lookup = np.zeros(num_classes, dtype=np.int32)
+    for group_id, group in enumerate(nms_class_groups, start=1):
+        for name in [group] if isinstance(group, str) else group:
+            ids = [i for i in ids_by_name.get(name, []) if 0 <= i < num_classes]
+            if not ids:
+                logger.warning(
+                    f"nms_class_groups: '{name}' is not a label of this model, ignoring it"
+                )
+                continue
+            lookup[ids] = group_id
+    logger.info(f"NMS class groups: {nms_class_groups}")
+    return lookup
+
+
+def _grouped_nms_boxes(
+    boxes_xywh: np.ndarray, class_ids: np.ndarray, class_groups: np.ndarray
+) -> np.ndarray:
+    """Shift boxes by group * span so boxes in different groups never overlap.
+
+    One NMSBoxes call then suppresses only within a group.
+    """
+    if len(boxes_xywh) == 0:
+        return boxes_xywh
+    class_ids = np.asarray(class_ids, dtype=np.int64)
+    group_ids = np.zeros(len(class_ids), dtype=np.float32)
+    known = class_ids < len(class_groups)
+    group_ids[known] = class_groups[class_ids[known]]
+    shifted = np.array(boxes_xywh, dtype=np.float32, copy=True)
+    # wider than any box extent, so shifted groups are disjoint
+    span = float(np.max(shifted[:, :2] + shifted[:, 2:]) - np.min(shifted[:, :2]) + 1.0)
+    shifted[:, :2] += group_ids[:, None] * span
+    return shifted
+
+
 def __post_process_multipart_yolo(
     output_list,
     width,
     height,
+    min_score: float = 0.4,
+    nms_threshold: float = 0.4,
+    max_detections: int = 20,
+    class_groups: np.ndarray | None = None,
 ):
     anchors = [
         [(12, 16), (19, 36), (40, 28)],
@@ -166,7 +223,7 @@ def __post_process_multipart_yolo(
                     class_conf = class_probs[class_id]
                     conf = class_conf * pred[4]
 
-                    if conf < 0.4:
+                    if conf < min_score:
                         continue
 
                     dx = pred[0]
@@ -188,17 +245,21 @@ def __post_process_multipart_yolo(
                     all_scores.append(conf)
                     all_class_ids.append(class_id)
 
+    nms_boxes = xyxy_to_xywh_for_nms(all_boxes)
+    if class_groups is not None and len(all_boxes) > 0:
+        nms_boxes = _grouped_nms_boxes(nms_boxes, all_class_ids, class_groups)
+
     indices = cv2.dnn.NMSBoxes(
-        bboxes=xyxy_to_xywh_for_nms(all_boxes),
+        bboxes=nms_boxes,
         scores=all_scores,
-        score_threshold=0.4,
-        nms_threshold=0.4,
+        score_threshold=min_score,
+        nms_threshold=nms_threshold,
     )
 
-    results = np.zeros((20, 6), np.float32)
+    results = np.zeros((max(20, max_detections), 6), np.float32)
 
     if len(indices) > 0:
-        for i, idx in enumerate(indices.flatten()[:20]):
+        for i, idx in enumerate(indices.flatten()[:max_detections]):
             class_id = all_class_ids[idx]
             conf = all_scores[idx]
             x1, y1, x2, y2 = all_boxes[idx]
@@ -214,7 +275,15 @@ def __post_process_multipart_yolo(
     return results
 
 
-def __post_process_nms_yolo(predictions: np.ndarray, width, height) -> np.ndarray:
+def __post_process_nms_yolo(
+    predictions: np.ndarray,
+    width,
+    height,
+    min_score: float = 0.4,
+    nms_threshold: float = 0.4,
+    max_detections: int = 20,
+    class_groups: np.ndarray | None = None,
+) -> np.ndarray:
     predictions = np.squeeze(predictions)
 
     # transpose the output so it has order (inferences, class_ids)
@@ -222,8 +291,8 @@ def __post_process_nms_yolo(predictions: np.ndarray, width, height) -> np.ndarra
         predictions = predictions.T
 
     scores = np.max(predictions[:, 4:], axis=1)
-    predictions = predictions[scores > 0.4, :]
-    scores = scores[scores > 0.4]
+    predictions = predictions[scores > min_score, :]
+    scores = scores[scores > min_score]
     class_ids = np.argmax(predictions[:, 4:], axis=1)
 
     # Rescale box
@@ -235,15 +304,18 @@ def __post_process_nms_yolo(predictions: np.ndarray, width, height) -> np.ndarra
     boxes_xyxy[:, 3] = boxes[:, 1] + boxes[:, 3] / 2
     boxes = boxes_xyxy
 
-    # run NMS
+    # run NMS (optionally only within class groups)
+    nms_boxes = xyxy_to_xywh_for_nms(boxes)
+    if class_groups is not None:
+        nms_boxes = _grouped_nms_boxes(nms_boxes, class_ids, class_groups)
     indices = cv2.dnn.NMSBoxes(
-        xyxy_to_xywh_for_nms(boxes), scores, score_threshold=0.4, nms_threshold=0.4
+        nms_boxes, scores, score_threshold=min_score, nms_threshold=nms_threshold
     )
-    detections = np.zeros((20, 6), np.float32)
+    detections = np.zeros((max(20, max_detections), 6), np.float32)
     for i, (bbox, confidence, class_id) in enumerate(
         zip(boxes[indices], scores[indices], class_ids[indices])
     ):
-        if i == 20:
+        if i == max_detections:
             break
 
         detections[i] = [
@@ -258,11 +330,59 @@ def __post_process_nms_yolo(predictions: np.ndarray, width, height) -> np.ndarra
     return detections
 
 
-def post_process_yolo(output: list[np.ndarray], width: int, height: int) -> np.ndarray:
+def post_process_yolo(
+    output: list[np.ndarray],
+    width: int,
+    height: int,
+    min_score: float = 0.4,
+    nms_threshold: float = 0.4,
+    max_detections: int = 20,
+    class_groups: np.ndarray | None = None,
+) -> np.ndarray:
+    """Decode YOLO output to rows of [class_id, score, ymin, xmin, ymax, xmax].
+
+    Returns max(20, max_detections) rows, zero-padded. The defaults reproduce
+    the original fixed behaviour (score 0.4, IoU 0.4, 20 rows, NMS across all
+    classes). class_groups is a class id -> group array from
+    build_nms_group_lookup(); boxes only suppress boxes of the same group.
+    """
+    kwargs = {
+        "min_score": min_score,
+        "nms_threshold": nms_threshold,
+        "max_detections": max_detections,
+        "class_groups": class_groups,
+    }
     if len(output) > 1:
-        return __post_process_multipart_yolo(output, width, height)
+        return __post_process_multipart_yolo(output, width, height, **kwargs)
     else:
-        return __post_process_nms_yolo(output[0], width, height)
+        return __post_process_nms_yolo(output[0], width, height, **kwargs)
+
+
+def yolo_decode_kwargs(
+    decode_config: Any,
+    labelmap: dict[int, str] | None,
+    max_rows: int | None = 20,
+    owner: str = "detector",
+) -> dict[str, Any]:
+    """post_process_yolo() keyword arguments from a YoloDecodeConfig.
+
+    max_rows caps max_detections (Frigate detectors: 20, the fixed result
+    buffer). Call once at startup; the group lookup is built here.
+    """
+    max_detections = int(getattr(decode_config, "max_detections", 20))
+    if max_rows is not None and max_detections > max_rows:
+        logger.warning(
+            f"{owner}: max_detections {max_detections} is more than Frigate accepts, using {max_rows}"
+        )
+        max_detections = max_rows
+    return {
+        "min_score": float(getattr(decode_config, "min_score", 0.4)),
+        "nms_threshold": float(getattr(decode_config, "nms_threshold", 0.4)),
+        "max_detections": max_detections,
+        "class_groups": build_nms_group_lookup(
+            getattr(decode_config, "nms_class_groups", None), labelmap
+        ),
+    }
 
 
 def post_process_yolox(
