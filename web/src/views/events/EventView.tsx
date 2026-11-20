@@ -1,3 +1,5 @@
+import { correctionParams, CorrectionKind } from "@/hooks/use-corrections";
+import { CorrectionOutcome, SaveAndReviewResponse } from "@/types/saveAndReview";
 import Logo from "@/components/Logo";
 import NewReviewData from "@/components/dynamic/NewReviewData";
 import CalendarFilterButton from "@/components/filter/CalendarFilterButton";
@@ -98,6 +100,7 @@ import {
 import ReviewActivityCalendar from "@/components/overlay/ReviewActivityCalendar";
 import PlatformAwareDialog from "@/components/overlay/dialog/PlatformAwareDialog";
 import MotionPreviewsPane from "./MotionPreviewsPane";
+import CorrectionsView from "./CorrectionsView";
 import { EmptyCard } from "@/components/card/EmptyCard";
 import { EmptyCardData } from "@/types/card";
 
@@ -152,11 +155,28 @@ export default function EventView({
   const { data: config } = useSWR<FrigateConfig>("config");
   const contentRef = useRef<HTMLDivElement | null>(null);
 
+  const [correctionKind, setCorrectionKind] = useState<CorrectionKind>("all");
+  const [correctionOutcome, setCorrectionOutcome] = useState<CorrectionOutcome>("all");
+  // null until the user flips it: follow the configured default.
+  const [hideEdgeSmallChoice, setHideEdgeSmall] = useState<boolean | null>(null);
+  const hideEdgeSmall = hideEdgeSmallChoice ?? config?.secondlook?.save_and_review.review?.hide_edge_small ?? true;
+  const {data: correctionCounts} = useSWR<SaveAndReviewResponse>(
+    config?.secondlook?.save_and_review.enabled ? ["secondlook/save_and_review", {...correctionParams(filter, correctionKind, showReviewed, hideEdgeSmall, correctionOutcome), limit: 1}] : null,
+    ([path, params]) => axios.get(path, {params}).then(r => r.data),
+    {refreshInterval: 10000},
+  );
+  const correctionCount = correctionCounts ? (showReviewed ? correctionCounts.total : correctionCounts.unreviewed) : -1;
+
   // review counts
 
   const reviewCounts = useMemo(() => {
     if (!reviewSummary) {
-      return { alert: -1, detection: -1, significant_motion: -1 };
+      return {
+        alert: -1,
+        detection: -1,
+        significant_motion: -1,
+        correction: -1,
+      };
     }
 
     let summary;
@@ -169,18 +189,20 @@ export default function EventView({
     }
 
     if (!summary) {
-      return { alert: 0, detection: 0, significant_motion: 0 };
+      return { alert: 0, detection: 0, significant_motion: 0, correction: 0 };
     }
 
     if (showReviewed) {
       return {
         alert: summary.total_alert ?? 0,
         detection: summary.total_detection ?? 0,
+        correction: 0,
       };
     } else {
       return {
         alert: summary.total_alert - summary.reviewed_alert,
         detection: summary.total_detection - summary.reviewed_detection,
+        correction: 0,
       };
     }
   }, [filter, showReviewed, reviewSummary]);
@@ -443,6 +465,41 @@ export default function EventView({
                 </div>
               </div>
             </ToggleGroupItem>
+            {config.secondlook?.save_and_review.enabled && (
+              <ToggleGroupItem
+                className={cn(
+                  severityToggle != "correction" && "text-muted-foreground",
+                )}
+                value="correction"
+                aria-label={t("corrections")}
+              >
+                <div
+                  className={cn(
+                    "flex size-6 items-center justify-center rounded text-primary sm:hidden",
+                    severityToggle == "correction"
+                      ? "font-semibold"
+                      : "font-medium",
+                  )}
+                >
+                  {correctionCount > -1 ? (
+                    correctionCount
+                  ) : (
+                    <ActivityIndicator className="size-4" />
+                  )}
+                </div>
+                <div className="hidden items-center sm:flex">
+                  <MdCircle className="size-2 text-primary md:mr-[10px]" />
+                  <div className="hidden md:flex md:flex-row md:items-center">
+                    {t("corrections")}
+                    {correctionCount > -1 ? (
+                      ` ∙ ${correctionCount}`
+                    ) : (
+                      <ActivityIndicator className="ml-2 size-4" />
+                    )}
+                  </div>
+                </div>
+              </ToggleGroupItem>
+            )}
             <ToggleGroupItem
               className={cn(
                 "rounded-lg px-3 py-4",
@@ -495,7 +552,21 @@ export default function EventView({
           motionPreviewsOpen ? "flex flex-col" : "flex",
         )}
       >
-        {severity != "significant_motion" && (
+        {severity == "correction" &&
+          config.secondlook?.save_and_review.enabled && (
+            <CorrectionsView
+              filter={filter}
+              showReviewed={showReviewed}
+              kind={correctionKind}
+              onKind={setCorrectionKind}
+              outcome={correctionOutcome}
+              onOutcome={setCorrectionOutcome}
+              hideEdgeSmall={hideEdgeSmall}
+              onHideEdgeSmall={setHideEdgeSmall}
+              onAllHistory={() => updateFilter({...filter, after: undefined, before: undefined})}
+            />
+          )}
+        {severity != "significant_motion" && severity != "correction" && (
           <DetectionReview
             contentRef={contentRef}
             reviewItems={reviewItems}

@@ -395,6 +395,27 @@ export type GenAIAgentConfig = {
 };
 
 export interface FrigateConfig {
+  secondlook?: {
+    enabled: boolean;
+    save_and_review: {
+      enabled: boolean;
+      database: { path: string };
+      images: { path: string };
+      review: {
+        group_gap_seconds: number;
+        hide_edge_small: boolean;
+        edge_margin_px: number;
+        small_dim_fraction: number;
+      };
+      retention: {
+        unreviewed_days: number | null;
+        ignored_days: number | null;
+        max_size_gb: number | null;
+        summary_days: number | null;
+        analyses_days: number | null;
+      };
+    };
+  };
   version: string;
   safe_mode: boolean;
 

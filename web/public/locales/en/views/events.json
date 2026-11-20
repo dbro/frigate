@@ -1,6 +1,7 @@
 {
   "alerts": "Alerts",
   "detections": "Detections",
+  "corrections": "Corrections",
   "motion": {
     "label": "Motion",
     "only": "Motion only"
@@ -9,6 +10,7 @@
   "empty": {
     "alert": "There are no alerts to review",
     "detection": "There are no detections to review",
+    "correction": "There are no corrections to review",
     "motion": "No motion data found",
     "recordingsDisabled": {
       "title": "Recordings must be enabled",

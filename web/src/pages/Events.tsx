@@ -46,10 +46,18 @@ export default function Events() {
 
   // recordings viewer
 
-  const [severity, setSeverity] = useOverlayState<ReviewSeverity>(
+  const [requestedSeverity, setSeverity] = useOverlayState<ReviewSeverity>(
     "severity",
     "alert",
   );
+
+  // A saved Corrections URL must not expose the experience while disabled.
+  const saveAndReviewEnabled =
+    config?.secondlook?.save_and_review.enabled === true;
+  const severity =
+    requestedSeverity === "correction" && !saveAndReviewEnabled
+      ? "alert"
+      : requestedSeverity;
 
   const [showReviewed, setShowReviewed] = useUserPersistence(
     "showReviewed",
@@ -430,6 +438,11 @@ export default function Events() {
   const currentItems = useMemo(() => {
     if (!reviewItems || !severity) {
       return null;
+    }
+
+    // Corrections are served from secondlook/save_and_review, not ReviewSegment
+    if (severity === "correction") {
+      return [];
     }
 
     let current;

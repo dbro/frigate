@@ -24,12 +24,14 @@ type CalendarFilterButtonProps = {
   reviewSummary?: ReviewSummary;
   recordingsSummary?: RecordingsSummary;
   day?: Date;
+  defaultText?: string;
   updateSelectedDay: (day?: Date) => void;
 };
 export default function CalendarFilterButton({
   reviewSummary,
   recordingsSummary,
   day,
+  defaultText,
   updateSelectedDay,
 }: CalendarFilterButtonProps) {
   const { t } = useTranslation(["components/filter", "views/events"]);
@@ -55,7 +57,7 @@ export default function CalendarFilterButton({
         className={`hidden md:block ${day == undefined ? "text-primary" : "text-selected-foreground"}`}
       >
         {day == undefined
-          ? t("calendarFilter.last24Hours", { ns: "views/events" })
+          ? defaultText ?? t("calendarFilter.last24Hours", { ns: "views/events" })
           : selectedDate}
       </div>
     </Button>

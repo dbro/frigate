@@ -9,7 +9,8 @@ export interface ReviewSegment {
   data: ReviewData;
 }
 
-export type ReviewSeverity = "alert" | "detection" | "significant_motion";
+export type ReviewSeverity =
+  "alert" | "detection" | "significant_motion" | "correction";
 
 export type ReviewData = {
   audio: string[];

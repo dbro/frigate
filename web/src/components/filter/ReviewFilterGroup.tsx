@@ -216,6 +216,7 @@ export default function ReviewFilterGroup({
       )}
       {isDesktop && filters.includes("date") && (
         <CalendarFilterButton
+          defaultText={currentSeverity === "correction" ? "All saved history" : undefined}
           reviewSummary={reviewSummary}
           recordingsSummary={recordingsSummary}
           day={
