@@ -27,6 +27,8 @@ from frigate.api import (
     preview,
     record,
     review,
+    save_and_review,
+    secondlook_debug,
 )
 from frigate.api.auth import get_jwt_secret, limiter, require_admin_by_default
 from frigate.comms.dispatcher import Dispatcher
@@ -141,6 +143,8 @@ def create_fastapi_app(
     app.include_router(chat.router)
     app.include_router(classification.router)
     app.include_router(review.router)
+    app.include_router(save_and_review.router)
+    app.include_router(secondlook_debug.router)
     app.include_router(main_app.router)
     app.include_router(preview.router)
     app.include_router(notification.router)
