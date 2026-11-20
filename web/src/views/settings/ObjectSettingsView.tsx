@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import ActivityIndicator from "@/components/indicators/activity-indicator";
+import SecondlookDebugInset from "@/components/camera/SecondlookDebugInset";
 import AutoUpdatingCameraImage from "@/components/camera/AutoUpdatingCameraImage";
 import { CameraConfig, FrigateConfig } from "@/types/frigateConfig";
 import { Toaster } from "@/components/ui/sonner";
@@ -55,6 +56,12 @@ export default function ObjectSettingsView({
   const containerRef = useRef<HTMLDivElement>(null);
 
   const DEBUG_OPTIONS = [
+    {
+      param: "secondlook",
+      title: "Secondlook analysed frame",
+      description:
+        "Show the latest secondary classification on its own analysed still, not current video.",
+    },
     {
       param: "bbox",
       title: t("debug.boundingBoxes.title"),
@@ -145,11 +152,13 @@ export default function ObjectSettingsView({
     }
 
     const params = new URLSearchParams(
-      Object.keys(options || {}).reduce((memo, key) => {
-        //@ts-expect-error we know this is correct
-        memo.push([key, options[key] === true ? "1" : "0"]);
-        return memo;
-      }, []),
+      Object.keys(options || {})
+        .filter((key) => key !== "secondlook")
+        .reduce((memo, key) => {
+          //@ts-expect-error we know this is correct
+          memo.push([key, options[key] === true ? "1" : "0"]);
+          return memo;
+        }, []),
     );
     return params;
   }, [options, optionsLoaded]);
@@ -338,6 +347,9 @@ export default function ObjectSettingsView({
             </TabsContent>
           )}
         </Tabs>
+        {options?.secondlook && (
+          <SecondlookDebugInset camera={cameraConfig.name} />
+        )}
       </div>
 
       {cameraConfig ? (

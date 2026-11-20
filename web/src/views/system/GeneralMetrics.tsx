@@ -9,6 +9,7 @@ import {
   GPUMemThreshold,
   GPUUsageThreshold,
   InferenceThreshold,
+  SecondlookProcessingThreshold,
 } from "@/types/graph";
 import { Button } from "@/components/ui/button";
 import {
@@ -19,6 +20,8 @@ import {
 import GPUInfoDialog from "@/components/overlay/GPUInfoDialog";
 import { Skeleton } from "@/components/ui/skeleton";
 import { ThresholdBarGraph } from "@/components/graph/SystemGraph";
+import { SecondlookDisagreementGraph } from "@/components/graph/SecondlookDisagreementGraph";
+import { SecondlookAnswersGraph } from "@/components/graph/SecondlookAnswersGraph";
 import { cn } from "@/lib/utils";
 import { useTranslation } from "react-i18next";
 import { CiCircleAlert } from "react-icons/ci";
@@ -43,7 +46,7 @@ export default function GeneralMetrics({
     [
       "stats/history",
       {
-        keys: "detectors.inference_speed,detectors.temperature,detectors.cpu,detectors.mem,gpu_usages,npu_usages,processes.cpu,processes.mem,service.last_updated",
+        keys: "secondlook,detectors.inference_speed,detectors.temperature,detectors.cpu,detectors.mem,gpu_usages,npu_usages,processes.cpu,processes.mem,service.last_updated",
       },
     ],
     {
@@ -651,6 +654,8 @@ export default function GeneralMetrics({
     return Object.values(series);
   }, [statsHistory, t]);
 
+  const secondlook = statsHistory.at(-1)?.secondlook;
+
   return (
     <>
       <GPUInfoDialog
@@ -660,6 +665,41 @@ export default function GeneralMetrics({
       />
 
       <div className="scrollbar-container mt-4 flex size-full flex-col overflow-y-auto">
+        {secondlook?.enabled && (
+          <section
+            aria-label="Secondlook disagreements per hour"
+            className="mb-4"
+          >
+            <div className="text-sm font-medium text-muted-foreground">
+              Secondlook disagreements per hour, last 7 days
+            </div>
+            <div className="mt-4 rounded-lg bg-background_alt p-2.5 md:rounded-2xl">
+              <div className="mb-2 text-xs text-muted-foreground">
+                Objects where Secondlook&apos;s score flips the primary
+                detector&apos;s decision. Orange and red: it would have, but the
+                alert was not changed (answer too late). Rates = disagreements ÷
+                objects analysed that hour.
+              </div>
+              <SecondlookDisagreementGraph />
+            </div>
+          </section>
+        )}
+        {secondlook?.enabled && (
+          <section aria-label="Secondlook answers per hour" className="mb-4">
+            <div className="text-sm font-medium text-muted-foreground">
+              Secondlook answers per hour, last 7 days
+            </div>
+            <div className="mt-4 rounded-lg bg-background_alt p-2.5 md:rounded-2xl">
+              <div className="mb-2 text-xs text-muted-foreground">
+                What happened to every tracked object Secondlook was asked
+                about, counted when it finished: agreed, or no usable answer (no
+                hit, timed out, dropped, failed open). Rates = objects ÷ objects
+                finished that hour.
+              </div>
+              <SecondlookAnswersGraph />
+            </div>
+          </section>
+        )}
         <div className="text-sm font-medium text-muted-foreground">
           {t("general.detector.title")}
         </div>
@@ -770,6 +810,110 @@ export default function GeneralMetrics({
             <Skeleton className="aspect-video w-full" />
           )}
         </div>
+
+        <section aria-label="Secondlook metrics">
+          <div className="mt-4 flex items-center gap-2 text-sm font-medium text-muted-foreground">
+            Secondlook
+            <Popover>
+              <PopoverTrigger asChild>
+                <button
+                  className="focus:outline-none"
+                  aria-label="About Secondlook metrics"
+                >
+                  <CiCircleAlert className="size-5" />
+                </button>
+              </PopoverTrigger>
+              <PopoverContent className="w-80 text-sm">
+                Each bar is one stats interval. Processing: the latest worker
+                time per analysis (preprocess, inference, association) completed
+                in that interval; no bar when nothing completed. Green under 500
+                ms, orange to 1 s, red from 1 s, where decisions time out
+                (hold_seconds 1.0) and fall back to the primary. Queue: the most
+                items at once in the interval, the one in process included, so 1
+                means busy without queuing and 0 idle. Orange at{" "}
+                {secondlook?.queue_max ?? 8} (queue max), red above it or when
+                requests were dropped (see SL analyses dropped/s on Cameras).
+                CPU and memory belong to the shared embeddings process below.
+                Temperature is device-wide, not per model.
+              </PopoverContent>
+            </Popover>
+          </div>
+          {!secondlook?.enabled ? (
+            <p className="mt-2 text-sm">
+              Secondlook disabled or statistics unavailable.
+            </p>
+          ) : !secondlook.available ? (
+            <p className="mt-2 text-sm">
+              No real Secondlook model available.
+              {secondlook.model_refusal && (
+                <>
+                  {" "}
+                  Model refused at startup (Secondlook fails open, primary
+                  unscaled): {secondlook.model_refusal}
+                </>
+              )}
+            </p>
+          ) : !secondlook.samples ? (
+            <p className="mt-2 text-sm">Waiting for completed inference.</p>
+          ) : (
+            <div className="mt-4 grid w-full grid-cols-1 gap-2 sm:grid-cols-3">
+              <div className="rounded-lg bg-background_alt p-2.5 md:rounded-2xl">
+                <div className="mb-5">Secondlook processing time</div>
+                <ThresholdBarGraph
+                  graphId="secondlook-processing"
+                  name={`secondlook (${secondlook.device ?? "?"})`}
+                  unit="ms"
+                  threshold={SecondlookProcessingThreshold}
+                  updateTimes={updateTimes}
+                  isActive={isActive}
+                  data={[
+                    {
+                      name: "processing",
+                      // a gap for intervals without a completed analysis
+                      data: statsHistory.map((stat, index) => ({
+                        x: index + 1,
+                        // 2 decimals at most, like detector inference speed
+                        y:
+                          stat.secondlook?.interval?.completed &&
+                          stat.secondlook.processing_ms != null
+                            ? Math.round(stat.secondlook.processing_ms * 100) /
+                              100
+                            : null,
+                      })),
+                    },
+                  ]}
+                />
+              </div>
+              <div className="rounded-lg bg-background_alt p-2.5 md:rounded-2xl">
+                <div className="mb-5">Secondlook queue (peak items)</div>
+                <ThresholdBarGraph
+                  graphId="secondlook-queue"
+                  name={`secondlook (max ${secondlook.queue_max ?? "?"})`}
+                  unit=""
+                  threshold={{
+                    warning: secondlook.queue_max ?? 8,
+                    error: (secondlook.queue_max ?? 8) + 1,
+                  }}
+                  updateTimes={updateTimes}
+                  isActive={isActive}
+                  data={[
+                    {
+                      name: "peak items",
+                      // red whenever requests were dropped in the interval
+                      data: statsHistory.map((stat, index) => ({
+                        x: index + 1,
+                        y: stat.secondlook?.interval?.queue_peak ?? null,
+                        ...(stat.secondlook?.interval?.dropped
+                          ? { fillColor: "#FA5252" }
+                          : {}),
+                      })),
+                    },
+                  ]}
+                />
+              </div>
+            </div>
+          )}
+        </section>
 
         {(statsHistory.length == 0 ||
           gpuSeries.length > 0 ||

@@ -10,7 +10,8 @@ import { MdCircle } from "react-icons/md";
 import useSWR from "swr";
 import { useTimeFormat } from "@/hooks/use-date-utils";
 
-const GRAPH_COLORS = ["#5C7CFA", "#ED5CFA", "#FAD75C"];
+// last two: Secondlook analyses completed / dropped on Frames / Detections
+const GRAPH_COLORS = ["#5C7CFA", "#ED5CFA", "#FAD75C", "#4ADE80", "#F87171"];
 
 type CameraLineGraphProps = {
   graphId: string;

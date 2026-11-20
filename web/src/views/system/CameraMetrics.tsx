@@ -5,7 +5,7 @@ import { ConnectionQualityIndicator } from "@/components/camera/ConnectionQualit
 import { EmptyCard } from "@/components/card/EmptyCard";
 import { Skeleton } from "@/components/ui/skeleton";
 import { FrigateConfig } from "@/types/frigateConfig";
-import { FrigateStats } from "@/types/stats";
+import { CameraStats, FrigateStats } from "@/types/stats";
 import {
   Fragment,
   startTransition,
@@ -26,6 +26,24 @@ import { useTranslation } from "react-i18next";
 import { CameraNameLabel } from "@/components/camera/FriendlyNameLabel";
 import { resolveCameraName } from "@/hooks/use-camera-friendly-name";
 import { isReplayCamera } from "@/utils/cameraUtil";
+
+const FRAMES_LABELS = [
+  "camera",
+  "detect",
+  "skipped",
+  "slCompleted",
+  "slDropped",
+];
+
+type Line = { name: string; data: { x: number; y: number | null }[] };
+
+/** Keep the two trailing Secondlook lines only when some snapshot has a rate. */
+function withSecondlookLines(lines: Line[]): Line[] {
+  const hasSecondlook = lines
+    .slice(3)
+    .some((line) => line.data.some((point) => point.y != null));
+  return hasSecondlook ? lines : lines.slice(0, 3);
+}
 
 type CameraMetricsProps = {
   lastUpdated: number;
@@ -55,7 +73,7 @@ export default function CameraMetrics({
     [
       "stats/history",
       {
-        keys: "cameras.camera_fps,cameras.detection_fps,cameras.skipped_fps,cameras.ffmpeg_cpu,cameras.capture_cpu,cameras.detect_cpu,cameras.connection_quality,cameras.expected_fps,cameras.reconnects_last_hour,cameras.stalls_last_hour,camera_fps,detection_fps,skipped_fps,service.last_updated",
+        keys: "cameras.camera_fps,cameras.detection_fps,cameras.skipped_fps,cameras.ffmpeg_cpu,cameras.capture_cpu,cameras.detect_cpu,cameras.connection_quality,cameras.expected_fps,cameras.reconnects_last_hour,cameras.stalls_last_hour,cameras.secondlook_analysed_ps,cameras.secondlook_skipped_ps,camera_fps,detection_fps,skipped_fps,service.last_updated",
       },
     ],
     {
@@ -119,9 +137,7 @@ export default function CameraMetrics({
       return [];
     }
 
-    const series: {
-      [key: string]: { name: string; data: { x: number; y: number }[] };
-    } = {};
+    const series: { [key: string]: Line } = {};
 
     series["overall_fps"] = {
       name: t("cameras.label.overallFramesPerSecond"),
@@ -133,6 +149,14 @@ export default function CameraMetrics({
     };
     series["overall_skipped_dps"] = {
       name: t("cameras.label.overallSkippedDetectionsPerSecond"),
+      data: [],
+    };
+    series["overall_sl_completed"] = {
+      name: t("cameras.label.overallSlCompleted"),
+      data: [],
+    };
+    series["overall_sl_dropped"] = {
+      name: t("cameras.label.overallSlDropped"),
       data: [],
     };
 
@@ -155,8 +179,25 @@ export default function CameraMetrics({
         x: statsIdx,
         y: stats.skipped_fps,
       });
+
+      // sums over cameras that report Secondlook rates in this snapshot
+      const slCameras = Object.values(stats.cameras ?? {}).filter(
+        (cam) => cam?.secondlook_analysed_ps != undefined,
+      );
+      const sum = (pick: (cam: CameraStats) => number | undefined) =>
+        slCameras.length
+          ? slCameras.reduce((total, cam) => total + (pick(cam) ?? 0), 0)
+          : null;
+      series["overall_sl_completed"].data.push({
+        x: statsIdx,
+        y: sum((cam) => cam.secondlook_analysed_ps),
+      });
+      series["overall_sl_dropped"].data.push({
+        x: statsIdx,
+        y: sum((cam) => cam.secondlook_skipped_ps),
+      });
     });
-    return Object.values(series);
+    return withSecondlookLines(Object.values(series));
   }, [statsHistory, t]);
 
   const cameraCpuSeries = useMemo(() => {
@@ -219,11 +260,7 @@ export default function CameraMetrics({
       return {};
     }
 
-    const series: {
-      [cam: string]: {
-        [key: string]: { name: string; data: { x: number; y: number }[] };
-      };
-    } = {};
+    const series: { [cam: string]: { [key: string]: Line } } = {};
 
     statsHistory.forEach((stats, statsIdx) => {
       if (!stats) {
@@ -256,6 +293,14 @@ export default function CameraMetrics({
             }),
             data: [],
           };
+          series[key]["sl_completed"] = {
+            name: t("cameras.label.cameraSlCompleted", { camName: camName }),
+            data: [],
+          };
+          series[key]["sl_dropped"] = {
+            name: t("cameras.label.cameraSlDropped", { camName: camName }),
+            data: [],
+          };
         }
 
         series[key]["fps"].data.push({
@@ -270,9 +315,26 @@ export default function CameraMetrics({
           x: statsIdx,
           y: camStats.skipped_fps,
         });
+        // absent (not zero) before the second snapshot or without a real model
+        series[key]["sl_completed"].data.push({
+          x: statsIdx,
+          y: camStats.secondlook_analysed_ps ?? null,
+        });
+        series[key]["sl_dropped"].data.push({
+          x: statsIdx,
+          y:
+            camStats.secondlook_analysed_ps == undefined
+              ? null
+              : (camStats.secondlook_skipped_ps ?? 0),
+        });
       });
     });
-    return series;
+    return Object.fromEntries(
+      Object.entries(series).map(([cam, lines]) => [
+        cam,
+        withSecondlookLines(Object.values(lines)),
+      ]),
+    );
   }, [getCameraName, statsHistory, t]);
 
   useEffect(() => {
@@ -304,7 +366,7 @@ export default function CameraMetrics({
             <CameraLineGraph
               graphId="overall-stats"
               unit=""
-              dataLabels={["camera", "detect", "skipped"]}
+              dataLabels={FRAMES_LABELS.slice(0, overallFpsSeries.length)}
               updateTimes={updateTimes}
               data={overallFpsSeries}
               isActive={isActive}
@@ -405,11 +467,12 @@ export default function CameraMetrics({
                             <CameraLineGraph
                               graphId={`${camera.name}-dps`}
                               unit=""
-                              dataLabels={["camera", "detect", "skipped"]}
-                              updateTimes={updateTimes}
-                              data={Object.values(
-                                cameraFpsSeries[camera.name] || {},
+                              dataLabels={FRAMES_LABELS.slice(
+                                0,
+                                cameraFpsSeries[camera.name].length,
                               )}
+                              updateTimes={updateTimes}
+                              data={cameraFpsSeries[camera.name]}
                               isActive={isActive}
                             />
                           </div>

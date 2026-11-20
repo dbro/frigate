@@ -33,11 +33,12 @@ export function ThresholdBarGraph({
     revalidateOnFocus: false,
   });
 
-  const lastValue = useMemo<number>(
+  // null (an interval without a value) shows as a dash, not 0
+  const lastValue = useMemo<number | null>(() => {
+    const last = data[0].data[data[0].data.length - 1];
     // @ts-expect-error y is valid
-    () => data[0].data[data[0].data.length - 1]?.y ?? 0,
-    [data],
-  );
+    return last === undefined ? 0 : last.y;
+  }, [data]);
 
   const yMax = useMemo(() => {
     if (unit != "%") {
@@ -211,8 +212,8 @@ export function ThresholdBarGraph({
       <div className="flex items-center gap-1">
         <div className="text-xs text-secondary-foreground">{displayName}</div>
         <div className="text-xs text-primary">
-          {lastValue}
-          {unit}
+          {lastValue ?? "–"}
+          {lastValue != null && unit}
         </div>
       </div>
       <Chart type="bar" options={options} series={chartData} height="120" />

@@ -23,6 +23,7 @@ import { useDocDomain } from "@/hooks/use-doc-domain";
 import { LuExternalLink } from "react-icons/lu";
 import { FaExclamationTriangle } from "react-icons/fa";
 import ActivityIndicator from "@/components/indicators/activity-indicator";
+import { getUnitSize } from "@/utils/storageUtil";
 
 type CameraStorage = {
   [key: string]: {
@@ -261,6 +262,58 @@ export default function StorageMetrics({
           />
         </div>
       </div>
+      {stats.secondlook?.storage && (
+        <section aria-label="Secondlook saved data storage">
+          <div className="mt-4 text-sm font-medium text-muted-foreground">
+            Secondlook saved data
+          </div>
+          <div className="mt-4 grid grid-cols-1 gap-2 sm:grid-cols-3">
+            {(
+              [
+                [
+                  "Secondlook database",
+                  stats.secondlook.storage.database_bytes,
+                  config?.secondlook?.save_and_review?.database?.path,
+                  "SQLite file incl. WAL/SHM",
+                ],
+                [
+                  "Secondlook images",
+                  stats.secondlook.storage.images_bytes,
+                  config?.secondlook?.save_and_review?.images?.path,
+                  `${stats.secondlook.storage.image_files} JPEG files`,
+                ],
+                [
+                  "Secondlook total",
+                  stats.secondlook.storage.database_bytes +
+                    stats.secondlook.storage.images_bytes,
+                  undefined,
+                  "Refreshed at most once a minute",
+                ],
+              ] as const
+            ).map(([title, bytes, path, note]) => (
+              <div
+                key={title}
+                className="flex-col rounded-lg bg-background_alt p-2.5 md:rounded-2xl"
+              >
+                <div className="mb-2">{title}</div>
+                <div className="text-lg font-medium">
+                  {getUnitSize(bytes / 1048576)}
+                </div>
+                <div className="break-all text-xs text-muted-foreground">
+                  {path ? `${path} · ${note}` : note}
+                </div>
+              </div>
+            ))}
+          </div>
+          <div className="mt-2 text-xs text-muted-foreground">
+            {stats.secondlook.storage.retention
+              ? `Cleanup last ran ${new Date(
+                  stats.secondlook.storage.retention.last_run * 1000,
+                ).toLocaleString()}: deleted ${stats.secondlook.storage.retention.deleted_rows} decisions, ${stats.secondlook.storage.retention.deleted_files} images, ${stats.secondlook.storage.retention.deleted_orphans} orphan images`
+              : "Cleanup has not run since Frigate started"}
+          </div>
+        </section>
+      )}
       <div className="mt-4 text-sm font-medium text-muted-foreground">
         {t("storage.cameraStorage.title")}
       </div>

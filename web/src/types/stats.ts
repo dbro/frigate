@@ -1,4 +1,92 @@
+/** One local clock hour of the Secondlook disagreement summary. */
+export type SecondlookHour = {
+  hour_start: number;
+  /** server-local hour start with offset, e.g. "2026-11-11T12:00+01:00" */
+  local_hour: string;
+  objects_analysed: number;
+  false_positive: number;
+  false_negative: number;
+  misclass: number;
+  /** FN split: released because of Secondlook, or not (answer too late). */
+  fn_rescued: number;
+  fn_not_rescued: number;
+  /** FP split: kept from release by Secondlook, or released anyway. */
+  fp_suppressed: number;
+  fp_not_suppressed: number;
+  /**
+   * Per tracked object Secondlook was asked about, counted once in the hour it
+   * finished (missing in responses from earlier builds). The five outcomes sum
+   * to tracks_finished; agreements is a subset of results + no_hit.
+   */
+  tracks_finished?: number;
+  agreements?: number;
+  results?: number;
+  no_hit?: number;
+  timeouts?: number;
+  dropped?: number;
+  fail_open?: number;
+};
+
+/** A (primary, Secondlook) model pair in the hourly table; "" = unknown. */
+export type SecondlookModelPair = {
+  primary_model_id: string;
+  sl_model_md5: string;
+  first_hour: number;
+  last_hour: number;
+};
+
+/** GET secondlook/disagreements/hourly: the last 168 hours, oldest first. */
+export type SecondlookHourly = {
+  timezone: string | null;
+  hours: SecondlookHour[];
+  models?: SecondlookModelPair[];
+};
+
 export interface FrigateStats {
+  secondlook?: {
+    enabled: boolean;
+    available: boolean;
+    samples: number;
+    last_updated: number | null;
+    inference_ms: number | null;
+    processing_ms: number | null;
+    queue_ms: number | null;
+    device?: string;
+    model_source?: "coco" | "frigate_plus" | null;
+    model_refusal?: string | null;
+    queue_dropped?: number;
+    results_dropped?: number;
+    /** Items now in Secondlook: frames waiting + the one in process (null without a real model). */
+    queue_items?: number | null;
+    /** Since the previous stats snapshot; null on the first one or without a real model. */
+    interval?: {
+      completed: number;
+      dropped: number;
+      /** most items at once, the one in process included */
+      queue_peak: number;
+    } | null;
+    queue_max?: number;
+    /** Corrected decisions since Frigate started (live counters, reset on restart). */
+    accuracy?: {
+      false_positive: number;
+      false_negative: number;
+      misclass: number;
+    };
+    storage?: {
+      database_bytes: number;
+      images_bytes: number;
+      image_files: number;
+      /** Last retention cleanup in this Frigate process; null until it ran. */
+      retention: {
+        last_run: number;
+        deleted_rows: number;
+        deleted_files: number;
+        missing_files: number;
+        deleted_orphans: number;
+        deleted_summary_rows: number;
+      } | null;
+    };
+  };
   cameras: { [camera_name: string]: CameraStats };
   cpu_usages: { [pid: string]: CpuStats };
   detectors: { [detectorKey: string]: DetectorStats };
@@ -14,6 +102,10 @@ export interface FrigateStats {
 }
 
 export type CameraStats = {
+  /** Secondlook analyses completed per second (real inferences only). */
+  secondlook_analysed_ps?: number;
+  /** Secondlook analyses requested but not performed per second (queue full or crop failure). */
+  secondlook_skipped_ps?: number;
   audio_dBFPS: number;
   audio_rms: number;
   camera_fps: number;

@@ -205,7 +205,13 @@
       "cameraGpu": "{{camName}} GPU",
       "cameraFramesPerSecond": "{{camName}} frames per second",
       "cameraDetectionsPerSecond": "{{camName}} detections per second",
-      "cameraSkippedDetectionsPerSecond": "{{camName}} skipped detections per second"
+      "cameraSkippedDetectionsPerSecond": "{{camName}} skipped detections per second",
+      "slCompleted": "SL analyses completed/s",
+      "slDropped": "SL analyses dropped/s",
+      "overallSlCompleted": "overall SL analyses completed per second",
+      "overallSlDropped": "overall SL analyses dropped per second",
+      "cameraSlCompleted": "{{camName}} SL analyses completed per second",
+      "cameraSlDropped": "{{camName}} SL analyses dropped per second"
     },
     "connectionQuality": {
       "title": "Connection Quality",

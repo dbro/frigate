@@ -18,6 +18,12 @@ export const InferenceThreshold = {
   error: 100,
 } as Threshold;
 
+// Secondlook decisions time out after hold_seconds (1.0 s) and fall back to the primary
+export const SecondlookProcessingThreshold = {
+  warning: 500,
+  error: 1000,
+} as Threshold;
+
 export const EmbeddingThreshold = {
   warning: 500,
   error: 1000,
