@@ -25,6 +25,10 @@ from frigate.util.image import (
     is_better_thumbnail,
 )
 from frigate.util.object import box_inside
+from frigate.secondlook.factor import adjusted_median_scores
+from frigate.secondlook.detection_check import decide_false_positive
+from frigate.secondlook import hourly
+from frigate.secondlook.metrics import count_correction, outcome_kind
 from frigate.util.velocity import calculate_real_world_speed
 
 logger = logging.getLogger(__name__)
@@ -52,6 +56,7 @@ class TrackedObject:
         del obj_data["score_history"]
 
         self.obj_data = obj_data
+        self.primary_model_id = getattr(model_config, "model_hash", None)
         self.colormap = model_config.colormap
         self.logos = model_config.all_attribute_logos
         self.thumbnail_attributes = [
@@ -72,6 +77,47 @@ class TrackedObject:
         self.has_clip = False
         self.has_snapshot = False
         self.top_score = self.computed_score = 0.0
+        # Secondlook live QA state (local patch)
+        self.secondlook_pending_since: float | None = None
+        self.secondlook_running: bool = False
+        self.secondlook_factor: float | None = None
+        self.primary_would_release = False
+        self.secondlook_counted_kinds: set[str] = set()
+        self.secondlook_analysed_counted = False
+        # extremes of every Secondlook factor seen; the outcome is decided once
+        # at track end (or when a late answer for an ended track arrives)
+        self.secondlook_factor_min: float | None = None
+        self.secondlook_factor_max: float | None = None
+        self.secondlook_result_seen = False
+        self.secondlook_outcome: str | None = None
+        self.secondlook_finished = False
+        # per-track analyses row (secondlook/analyses.py): request seen, answers
+        # by kind, model identity from the answers
+        self.secondlook_asked = False
+        self.secondlook_answers: dict[str, int] = {}
+        self.secondlook_model_md5: str | None = None
+        self.secondlook_model_name: str | None = None
+        self.secondlook_last_sl_score: float | None = None
+        self.secondlook_hold_expired = False
+        self.secondlook_answer_after_end = False
+        self.secondlook_analysis_written = False
+        self.primary_crossing_median = 0.0
+        # the score buffer before detection at the primary's highest median of the track:
+        # where a factor would first release (FN) or must hold back (FP)
+        self.primary_peak_history: list[float] = list(self.score_history)
+        self.primary_peak_median = (
+            median(self.score_history) if self.score_history else -1.0
+        )
+        self.save_and_review_decisions: dict[str, dict] = {}
+        self.secondlook_evidence: dict | None = None
+        self.secondlook_hold_done: bool = False
+        self._secondlook_frame_time: float | None = None
+        # Fine-tune example candidate (max-primary full frame during track)
+        self.save_and_review_best_primary: float = 0.0
+        self.save_and_review_box: list[int] | None = None
+        self.save_and_review_frame_time: float | None = None
+        self.save_and_review_jpeg: bytes | None = None
+        self.save_and_review_needs_frame: bool = False
         self.thumbnail_data: dict[str, Any] | None = None
         self.last_updated: float = 0
         self.last_published: float = 0
@@ -115,17 +161,279 @@ class TrackedObject:
 
         return None
 
-    def _is_false_positive(self) -> bool:
-        # once a true positive, always a true positive
-        if not self.false_positive:
+    def _secondlook_enabled_for_label(self) -> bool:
+        cam_sl = getattr(self.camera_config, "secondlook", None)
+        if cam_sl is None or not cam_sl.enabled:
             return False
+        objects = cam_sl.objects
+        if objects is None:
+            # objects inherited at config merge; if still None, treat as disabled list
+            return False
+        return self.obj_data["label"] in objects
 
+    def _is_false_positive(self) -> bool:
         threshold = self.camera_config.objects.filters[self.obj_data["label"]].threshold
-        return self.computed_score < threshold
+        sl_enabled = self._secondlook_enabled_for_label()
+        if not sl_enabled:
+            # stock: once a true positive, always a true positive
+            if not self.false_positive:
+                return False
+            return self.computed_score < threshold
+
+        hold_seconds = float(
+            getattr(self.camera_config.secondlook, "hold_seconds", 1.0)
+        )
+        # check the frame being processed (obj_data is merged after this check)
+        now = float(
+            self._secondlook_frame_time or self.obj_data.get("frame_time") or 0.0
+        )
+
+        is_fp, new_pending = decide_false_positive(
+            already_true_positive=not self.false_positive,
+            secondlook_enabled=True,
+            score_history=self.score_history,
+            threshold=threshold,
+            factor=self.secondlook_factor,
+            pending_since=self.secondlook_pending_since,
+            frame_time=now,
+            hold_seconds=hold_seconds,
+            running=self.secondlook_running,
+            hold_done=self.secondlook_hold_done,
+        )
+        if self.false_positive and self.secondlook_factor is None:
+            if new_pending is None:
+                if (
+                    not self.secondlook_hold_done
+                    and self.secondlook_pending_since is not None
+                ):
+                    self.secondlook_hold_expired = True
+                if (
+                    not self.secondlook_hold_done
+                    and self.secondlook_pending_since is not None
+                    and self.camera_config.secondlook._save_and_review_enabled
+                ):
+                    from frigate.secondlook.save_and_review import (
+                        get_save_and_review_store,
+                    )
+
+                    store = get_save_and_review_store()
+                    if store is not None:
+                        store.diagnostics["hold_timeouts"] += 1
+                # hold expired (or already done): never re-arm for this track
+                self.secondlook_pending_since = None
+                self.secondlook_hold_done = True
+            else:
+                self.secondlook_pending_since = new_pending
+        return is_fp
+
+    def _remember_correction(self, raw_median, threshold, was_fp, decision_time):
+        sl = self.obj_data.get("secondlook") or {}
+        factor = self.secondlook_factor
+        kind = None
+        # FP / FN candidates whether or not the pipeline acted on them (the
+        # outcome is final at track end, see finish_secondlook); misclass has
+        # no live effect and is counted here as before
+        if sl.get("misclass_label"):
+            kind = "misclass"
+        elif (
+            self.primary_would_release
+            and factor is not None
+            and factor < self.camera_config.secondlook._gap_factor_low
+        ):
+            kind = "false_positive"
+        elif (
+            not self.primary_would_release
+            and factor is not None
+            and factor > self.camera_config.secondlook._gap_factor_high
+        ):
+            kind = "false_negative"
+        if kind == "misclass" and kind not in self.secondlook_counted_kinds:
+            # live accuracy counter: once per track and kind, whether or not
+            # examples are saved
+            self.secondlook_counted_kinds.add(kind)
+            count_correction(kind)
+            if self.camera_config.secondlook._save_and_review_enabled:
+                self._hourly(kind)
+        if kind and self.camera_config.secondlook._save_and_review_enabled:
+            candidate = {
+                "evidence": self.secondlook_evidence,
+                "sl": dict(sl),
+                "raw_median": self.primary_crossing_median
+                if kind == "false_positive"
+                else raw_median,
+                "threshold": threshold,
+                "decision_time": decision_time,
+                "factor": factor,
+            }
+            old = self.save_and_review_decisions.get(kind)
+            score = (self.secondlook_evidence or {}).get("primary_score", 0)
+            if old is None:
+                from frigate.secondlook.save_and_review import get_save_and_review_store
+
+                store = get_save_and_review_store()
+                if store is not None:
+                    store.diagnostics["qualifying_" + kind] += 1
+            if old is None or score >= (old.get("evidence") or {}).get(
+                "primary_score", 0
+            ):
+                self.save_and_review_decisions[kind] = candidate
 
     def compute_score(self) -> float:
         """get median of scores for object."""
+        if self.secondlook_factor is not None and self._secondlook_enabled_for_label():
+            return median(
+                adjusted_median_scores(self.score_history, self.secondlook_factor)
+            )
         return median(self.score_history)
+
+    def apply_secondlook(self, payload: dict[str, Any]) -> None:
+        """Store Secondlook metadata from the embeddings process.
+
+        A pending payload only marks SL as running. Any final payload ends the
+        hold: factor set -> scale; factor None (no same-class hit, or
+        queue-full fail-open) -> unset = 1.0, per the configured rules.
+        """
+        self.secondlook_asked = True
+        if payload.get("model_md5"):
+            self.secondlook_model_md5 = payload["model_md5"]
+        if payload.get("model_id"):
+            self.secondlook_model_name = payload["model_id"]
+        if payload.get("pending"):
+            if not self.secondlook_hold_done:
+                self.obj_data["secondlook"] = payload
+                self.secondlook_running = True
+            return
+
+        if (
+            self.camera_config.secondlook._save_and_review_enabled
+            and self._secondlook_enabled_for_label()
+        ):
+            from frigate.secondlook.save_and_review import get_save_and_review_store
+
+            store = get_save_and_review_store()
+            if store is not None:
+                store.diagnostics["results_received"] += 1
+                if payload.get("factor") is None:
+                    store.diagnostics["results_unset_factor"] += 1
+                if payload.get("applied_by") == "secondlook_no_hit":
+                    store.diagnostics["results_no_same_class"] += 1
+                if payload.get("misclass_label"):
+                    store.diagnostics["results_diff_class"] += 1
+        if (
+            payload.get("analysed")
+            and not self.secondlook_analysed_counted
+            and self.camera_config.secondlook._save_and_review_enabled
+        ):
+            # hourly summary: each tracked object once, on its first result
+            self.secondlook_analysed_counted = True
+            self._hourly(hourly.ANALYSED)
+        from frigate.secondlook.analyses import answer_kind
+
+        kind = answer_kind(payload)
+        self.secondlook_answers[kind] = self.secondlook_answers.get(kind, 0) + 1
+        if payload.get("sl_score") is not None:
+            self.secondlook_last_sl_score = float(payload["sl_score"])
+        self.secondlook_evidence = payload.get("evidence")
+        self.obj_data["secondlook"] = {
+            k: v for k, v in payload.items() if k != "evidence"
+        }
+
+        self.secondlook_running = False
+        self.secondlook_pending_since = None
+        self.secondlook_hold_done = True
+        self.secondlook_result_seen = True
+        factor = payload.get("factor")
+        self.secondlook_factor = None if factor is None else float(factor)
+        if self.secondlook_factor is not None:
+            f = self.secondlook_factor
+            lo, hi = self.secondlook_factor_min, self.secondlook_factor_max
+            self.secondlook_factor_min = f if lo is None else min(lo, f)
+            self.secondlook_factor_max = f if hi is None else max(hi, f)
+
+    def _hourly(self, *columns: str) -> None:
+        hourly.record(
+            self.camera_config.name,
+            self.obj_data["label"],
+            *columns,
+            primary_model_id=self.primary_model_id,
+            sl_model_md5=self.secondlook_model_md5,
+        )
+
+    def awaiting_secondlook(self) -> bool:
+        """Analysis requested (pending seen) but no answer yet."""
+        return (
+            self._secondlook_enabled_for_label()
+            and self.secondlook_running
+            and not self.secondlook_result_seen
+        )
+
+    def _scaled_peak_median(self, factor: float) -> float:
+        """Median of the peak score-buffer window with the factor applied."""
+        return median(adjusted_median_scores(self.primary_peak_history, factor))
+
+    def live_outcome(self) -> str | None:
+        """Did Secondlook's disagreement change what the pipeline did?
+
+        A disagreement counts only if the factor flips whether it becomes a detection.
+        Release is permanent and happens at the first frame whose (scaled)
+        median reaches the threshold, so the deciding window is the track's
+        peak raw-median window: FN = primary never reached the threshold, the
+        factor is above gap_factor_high and the scaled peak median reaches it;
+        FP = primary reached it, the factor is below gap_factor_low and the
+        scaled peak median stays below it. Near-agreements are neither.
+        released = published as a detection (never un-released): FN rescued
+        if released, FP suppressed if never released; answers too late to
+        matter land in the not_ halves.
+        """
+        if not self._secondlook_enabled_for_label() or not self.primary_peak_history:
+            return None
+        released = not self.false_positive
+        sl = self.camera_config.secondlook
+        threshold = self.camera_config.objects.filters[self.obj_data["label"]].threshold
+        high, low = self.secondlook_factor_max, self.secondlook_factor_min
+        if (
+            not self.primary_would_release
+            and high is not None
+            and high > sl._gap_factor_high
+            and self._scaled_peak_median(high) >= threshold
+        ):
+            return "fn_rescued" if released else "fn_not_rescued"
+        if (
+            self.primary_would_release
+            and low is not None
+            and low < sl._gap_factor_low
+            and self._scaled_peak_median(low) < threshold
+        ):
+            return "fp_not_suppressed" if released else "fp_suppressed"
+        return None
+
+    def finish_secondlook(self) -> str | None:
+        """Count the final FN/FP outcome once per track (live + hourly)."""
+        if self.secondlook_finished:
+            return self.secondlook_outcome
+        self.secondlook_finished = True
+        if self._secondlook_enabled_for_label():
+            # an answer applied after the last update has no candidate yet
+            threshold = self.camera_config.objects.filters[
+                self.obj_data["label"]
+            ].threshold
+            self._remember_correction(
+                median(self.score_history) if self.score_history else 0.0,
+                threshold,
+                self.false_positive,
+                self.obj_data.get("frame_time"),
+            )
+        outcome = self.live_outcome()
+        self.secondlook_outcome = outcome
+        if outcome is None:
+            return None
+        kind = outcome_kind(outcome)
+        if kind not in self.secondlook_counted_kinds:
+            self.secondlook_counted_kinds.add(kind)
+            count_correction(kind, outcome)
+            if self.camera_config.secondlook._save_and_review_enabled:
+                self._hourly(kind, outcome)
+        return outcome
 
     def update(
         self, current_frame_time: float, obj_data: dict[str, Any], has_valid_frame: bool
@@ -144,11 +452,52 @@ class TrackedObject:
         if len(self.score_history) > 10:
             self.score_history = self.score_history[-10:]
 
+        # Max-primary frame for Corrections fine-tune still (track end deposit)
+        if (
+            self._secondlook_enabled_for_label()
+            and self.camera_config.secondlook._save_and_review_enabled
+            and obj_data.get("frame_time") == current_frame_time
+        ):
+            hit = float(obj_data.get("score") or 0.0)
+            if hit > 0.0 and hit >= self.save_and_review_best_primary:
+                self.save_and_review_best_primary = hit
+                self.save_and_review_box = (
+                    list(obj_data["box"]) if obj_data.get("box") else None
+                )
+                self.save_and_review_frame_time = current_frame_time
+                self.save_and_review_needs_frame = True
+
         # calculate if this is a false positive
+        self._secondlook_frame_time = current_frame_time
         self.computed_score = self.compute_score()
         if self.computed_score > self.top_score:
             self.top_score = self.computed_score
+        was_false_positive = self.false_positive
+        raw_median = median(self.score_history) if self.score_history else 0.0
+        if raw_median > self.primary_peak_median:
+            self.primary_peak_median = raw_median
+            self.primary_peak_history = list(self.score_history)
+        threshold = self.camera_config.objects.filters[self.obj_data["label"]].threshold
+        was_primary = self.primary_would_release
+        self.primary_would_release |= raw_median >= threshold
+        if not was_primary and self.primary_would_release:
+            self.primary_crossing_median = raw_median
         self.false_positive = self._is_false_positive()
+        if (
+            self.camera_config.secondlook._save_and_review_enabled
+            and self._secondlook_enabled_for_label()
+        ):
+            from frigate.secondlook.save_and_review import get_save_and_review_store
+
+            store = get_save_and_review_store()
+            if store is not None:
+                if not was_primary and self.primary_would_release:
+                    store.diagnostics["raw_primary_threshold_crossings"] += 1
+                if was_false_positive and not self.false_positive:
+                    store.diagnostics["actual_releases"] += 1
+        self._remember_correction(
+            raw_median, threshold, was_false_positive, current_frame_time
+        )
         self.active = self.is_active()
 
         if not self.false_positive and has_valid_frame:
@@ -526,6 +875,23 @@ class TrackedObject:
                 "wb",
             ) as p:
                 p.write(webp_bytes)
+
+    def capture_save_and_review_frame(self, yuv_frame: np.ndarray) -> None:
+        """Encode full detect frame JPEG for Corrections deposit (max-primary)."""
+        if not self.camera_config.secondlook._save_and_review_enabled:
+            return
+        try:
+            bgr = cv2.cvtColor(yuv_frame, cv2.COLOR_YUV2BGR_I420)
+            ok, buf = cv2.imencode(".jpg", bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
+            if ok:
+                self.save_and_review_jpeg = buf.tobytes()
+                self.save_and_review_needs_frame = False
+        except Exception:
+            logger.debug(
+                "Secondlook example frame encode failed for %s",
+                self.obj_data.get("id"),
+                exc_info=True,
+            )
 
     def write_thumbnail_to_disk(self) -> None:
         if not self.camera_config.name:

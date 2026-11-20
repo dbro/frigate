@@ -76,6 +76,8 @@ from frigate.record.cleanup import RecordingCleanup
 from frigate.record.export import migrate_exports
 from frigate.record.record import RecordProcess
 from frigate.review.review import ReviewProcess
+from frigate.secondlook.retention import start_retention
+from frigate.secondlook.save_and_review import configure_save_and_review
 from frigate.stats.emitter import StatsEmitter
 from frigate.stats.util import stats_init
 from frigate.storage import StorageMaintainer
@@ -223,6 +225,28 @@ class FrigateApp:
             vacuum_db(migrate_db)
 
         migrate_db.close()
+
+    def init_secondlook_save_and_review(self) -> None:
+        """Open the separate Secondlook fine-tune examples SQLite store."""
+        sl = self.config.secondlook
+        try:
+            store = configure_save_and_review(sl.save_and_review)
+            if store is None:
+                return
+            # hourly disagreement buckets follow the UI time zone, else local
+            store.timezone = self.config.ui.timezone
+            # display label for rows whose answers carried no model; the MD5
+            # comes from the Secondlook processor, which hashes the file once
+            store.sl_model_name = os.path.basename(sl.model.path or "") or None
+            start_retention(store, sl.save_and_review.retention)
+            logger.info(
+                "Secondlook save-and-review store ready db=%s dir=%s",
+                sl.save_and_review.database.path,
+                sl.save_and_review.images.path,
+            )
+        except Exception:
+            logger.exception("Failed to init Secondlook save-and-review store")
+
 
     def init_go2rtc(self) -> None:
         for proc in psutil.process_iter(["pid", "name"]):
@@ -570,6 +594,7 @@ class FrigateApp:
         self.init_camera_metrics()
         self.init_queues()
         self.init_database()
+        self.init_secondlook_save_and_review()
         self.init_onvif()
         self.init_recording_manager()
         self.init_review_segment_manager()

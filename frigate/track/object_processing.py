@@ -42,6 +42,9 @@ from frigate.const import (
 from frigate.events.types import EventStateEnum, EventTypeEnum
 from frigate.models import Event, ReviewSegment, Timeline
 from frigate.ptz.autotrack import PtzAutoTrackerThread
+from frigate.secondlook import analyses as secondlook_analyses
+from frigate.secondlook import late as secondlook_late
+from frigate.secondlook.save_and_review_deposit import save_track_for_review
 from frigate.track.tracked_object import TrackedObject
 from frigate.util.image import SharedMemoryFrameManager
 
@@ -52,6 +55,30 @@ class ManualEventState(str, Enum):
     complete = "complete"
     start = "start"
     end = "end"
+
+
+def finish_secondlook_track(obj: TrackedObject, sl_config) -> None:
+    """Count the final live outcome, write the track's analyses row and save
+    the Review item, once per track."""
+    try:
+        obj.finish_secondlook()
+    except Exception:
+        logger.exception("Secondlook outcome failed for %s", obj.obj_data.get("id"))
+    if sl_config is not None and sl_config.save_and_review.enabled:
+        # its own guard: a failed deposit must not cost the track its row
+        secondlook_analyses.record_track(obj)
+    try:
+        save_track_for_review(obj, sl_config)
+    except Exception:
+        logger.exception(
+            "Secondlook outcome/deposit failed for %s", obj.obj_data.get("id")
+        )
+
+
+def finish_expired_secondlook_tracks(sl_config) -> None:
+    """Finish ended tracks whose Secondlook answer never came."""
+    for obj in secondlook_late.expired():
+        finish_secondlook_track(obj, sl_config)
 
 
 class TrackedObjectProcessor(threading.Thread):
@@ -187,6 +214,14 @@ class TrackedObjectProcessor(threading.Thread):
                     obj.to_dict(),
                 )
             )
+
+            # Secondlook: final live outcome + one Review item per corrected
+            # track; wait for an answer still on its way (see secondlook/late)
+            finish_expired_secondlook_tracks(self.config.secondlook)
+            if obj.awaiting_secondlook():
+                secondlook_late.park(str(obj.obj_data["id"]), obj)
+            else:
+                finish_secondlook_track(obj, self.config.secondlook)
 
         def snapshot(camera: str, obj: TrackedObject) -> bool:
             mqtt_config: CameraMqttConfig = camera_state.camera_config.mqtt
@@ -509,6 +544,64 @@ class TrackedObjectProcessor(threading.Thread):
             event.data = data
             event.save()
 
+    def set_secondlook(self, event_id: str, payload: dict) -> None:
+        """Apply Secondlook live QA payload to a tracked object (and Event if present)."""
+        # Keep the last analysed still even when its track expired during inference.
+        evidence = payload.get("evidence")
+        frame_state = (
+            self.camera_states.get(evidence.get("camera")) if evidence else None
+        )
+        if frame_state is not None and evidence["frame_time"] >= (
+            getattr(frame_state, "latest_secondlook", None) or {}
+        ).get("frame_time", 0):
+            frame_state.latest_secondlook = evidence
+        tracked_obj: TrackedObject | None = None
+
+        for state in self.camera_states.values():
+            tracked_obj = state.tracked_objects.get(event_id)
+            if tracked_obj is not None:
+                break
+
+        try:
+            event: Event | None = Event.get(Event.id == event_id)
+        except DoesNotExist:
+            event = None
+
+        if not tracked_obj and not payload.get("pending"):
+            # the answer for a track that already ended: it was too late to
+            # change anything, but still counts (outcome uses the final state)
+            late_obj = secondlook_late.take(event_id)
+            if late_obj is not None:
+                late_obj.secondlook_answer_after_end = True
+                late_obj.apply_secondlook(payload)
+                finish_secondlook_track(late_obj, self.config.secondlook)
+        for expired in secondlook_late.expired():
+            finish_secondlook_track(expired, self.config.secondlook)
+
+        if not tracked_obj and not event:
+            return
+
+        if tracked_obj:
+            evidence = payload.get("evidence")
+            if evidence and evidence["frame_time"] >= (
+                getattr(state, "latest_secondlook", None) or {}
+            ).get("frame_time", 0):
+                state.latest_secondlook = {
+                    **evidence,
+                    "label": tracked_obj.obj_data["label"],
+                }
+            tracked_obj.apply_secondlook(payload)
+
+        if event:
+            data = event.data
+            data["secondlook"] = {k: v for k, v in payload.items() if k != "evidence"}
+            event.data = data
+            # Only persist when an Event row already exists (object already released).
+            try:
+                event.save()
+            except Exception:
+                pass
+
     def save_lpr_snapshot(self, payload: tuple) -> None:
         # save the snapshot image
         (frame, event_id, camera) = payload
@@ -769,6 +862,9 @@ class TrackedObjectProcessor(threading.Thread):
                     self.create_manual_event(payload)
                 elif topic.endswith(EventMetadataTypeEnum.manual_event_end.value):
                     self.end_manual_event(payload)
+                elif topic.endswith(EventMetadataTypeEnum.secondlook.value):
+                    event_id, sl_payload = payload
+                    self.set_secondlook(event_id, sl_payload)
 
             try:
                 (

@@ -58,6 +58,7 @@ from frigate.data_processing.real_time.face import FaceRealTimeProcessor
 from frigate.data_processing.real_time.license_plate import (
     LicensePlateRealTimeProcessor,
 )
+from frigate.data_processing.real_time.secondlook import SecondlookProcessor
 from frigate.data_processing.types import DataProcessorMetrics, PostProcessDataEnum
 from frigate.db.sqlitevecq import SqliteVecQueueDatabase
 from frigate.events.types import (
@@ -189,6 +190,14 @@ class EmbeddingMaintainer(threading.Thread):
                 )
             )
             logger.debug("FaceRealTimeProcessor initialized successfully")
+
+        if self.config.secondlook.enabled:
+            logger.debug("Secondlook enabled, initializing SecondlookProcessor")
+            self.realtime_processors.append(
+                SecondlookProcessor(
+                    self.config, self.event_metadata_publisher, metrics
+                )
+            )
 
         if self.config.classification.bird.enabled:
             self.realtime_processors.append(
@@ -548,6 +557,9 @@ class EmbeddingMaintainer(threading.Thread):
             f"Processing {len(self.realtime_processors)} realtime processors for object {data.get('id')} (label: {data.get('label')})"
         )
         for processor in self.realtime_processors:
+            if isinstance(processor, SecondlookProcessor):
+                # Secondlook needs every video frame incl. FPs — see _process_frame_updates
+                continue
             logger.debug(f"Calling process_frame on {processor.__class__.__name__}")
             processor.process_frame(data, yuv_frame)
 
@@ -739,13 +751,13 @@ class EmbeddingMaintainer(threading.Thread):
                     )
 
     def _process_frame_updates(self) -> None:
-        """Process event updates"""
+        """Process per-frame video detection updates (all tracked objects)."""
         (topic, data) = self.detection_subscriber.check_for_update()
 
         if topic is None:
             return
 
-        camera, frame_name, _, _, motion_boxes, _ = data
+        camera, frame_name, frame_time, tracked_objects, motion_boxes, _ = data
 
         if not camera or camera not in self.config.cameras:
             return
@@ -763,7 +775,16 @@ class EmbeddingMaintainer(threading.Thread):
             c.enabled for c in self.config.classification.custom.values()
         )
 
-        if not dedicated_lpr_enabled and not has_enabled_custom:
+        secondlook_enabled = (
+            self.config.secondlook.enabled
+            and camera_config.secondlook.enabled
+        )
+
+        if (
+            not dedicated_lpr_enabled
+            and not has_enabled_custom
+            and not secondlook_enabled
+        ):
             # no active features that use this data
             return
 
@@ -772,11 +793,11 @@ class EmbeddingMaintainer(threading.Thread):
                 frame_name, camera_config.frame_shape_yuv
             )
         except FileNotFoundError:
-            pass
+            return
 
         if yuv_frame is None:
             logger.debug(
-                "Unable to process dedicated LPR update because frame is unavailable."
+                "Unable to process frame update because frame is unavailable."
             )
             return
 
@@ -793,7 +814,15 @@ class EmbeddingMaintainer(threading.Thread):
                     {"camera": camera, "motion": motion_boxes}, yuv_frame
                 )
 
+            if secondlook_enabled and isinstance(processor, SecondlookProcessor):
+                for obj in tracked_objects or []:
+                    # Only objects present on this frame (real hits / current box)
+                    if obj.get("frame_time") != frame_time:
+                        continue
+                    processor.process_frame(obj, yuv_frame)
+
         self.frame_manager.close(frame_name)
+
 
     def _process_deferred_results(self) -> None:
         """Drain results from deferred processors and perform IPC side-effects."""
@@ -801,6 +830,35 @@ class EmbeddingMaintainer(threading.Thread):
             results = processor.drain_results()
 
             for result in results:
+                if result.get("type") == "secondlook":
+                    self.event_metadata_publisher.publish(
+                        (
+                            result["object_id"],
+                            {
+                                "factor": result.get("factor"),
+                                "provisional": result.get("provisional", False),
+                                "sl_score": result.get("sl_score"),
+                                "sl_box": result.get("sl_box"),
+                                "evidence": result.get("evidence"),
+                                "misclass_label": result.get("misclass_label"),
+                                "misclass_score": result.get("misclass_score"),
+                                "misclass_box": result.get("misclass_box"),
+                                "primary_score": result.get("primary_score"),
+                                "frame_time": result.get("frame_time"),
+                                "model_id": result.get("model_id"),
+                                "model_md5": result.get("model_md5"),
+                                "latency_ms": result.get("latency_ms"),
+                                "applied_by": result.get("applied_by"),
+                                "running": result.get("running", False),
+                                "pending": result.get("pending", False),
+                                "analysed": result.get("analysed", False),
+                                "fail_open": result.get("fail_open", False),
+                            },
+                        ),
+                        EventMetadataTypeEnum.secondlook.value,
+                    )
+                    continue
+
                 if result.get("type") != "classification":
                     continue
 

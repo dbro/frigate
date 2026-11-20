@@ -12,6 +12,7 @@ from typing import Any
 import requests
 from requests.exceptions import RequestException
 
+from frigate.secondlook.metrics import camera_rates, secondlook_stats
 from frigate.config import FrigateConfig
 from frigate.const import CACHE_DIR, CLIPS_DIR, RECORD_DIR
 from frigate.data_processing.types import DataProcessorMetrics
@@ -414,6 +415,14 @@ def stats_snapshot(
     stats["skipped_fps"] = round(total_skipped_fps, 2)
     stats["detection_fps"] = round(total_detection_fps, 2)
 
+    stats["secondlook"] = secondlook_stats(
+        config, stats_tracking.get("embeddings_metrics")
+    )
+    for name, rates in camera_rates(
+        config, stats_tracking.get("embeddings_metrics")
+    ).items():
+        if name in stats["cameras"]:
+            stats["cameras"][name].update(rates)
     stats["embeddings"] = {}
 
     # Get metrics if available

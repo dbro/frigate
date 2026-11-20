@@ -12,6 +12,7 @@ from frigate.data_processing.real_time.whisper_online import FasterWhisperASR
 
 
 class DataProcessorMetrics:
+    secondlook: DictProxy[str, Any]
     image_embeddings_speed: ValueProxy[float]
     image_embeddings_eps: ValueProxy[float]
     text_embeddings_speed: ValueProxy[float]
@@ -30,6 +31,7 @@ class DataProcessorMetrics:
     classification_cps: DictProxy[str, ValueProxy[float]]
 
     def __init__(self, manager: SyncManager, custom_classification_models: list[str]):
+        self.secondlook = manager.dict()
         self.image_embeddings_speed = manager.Value("d", 0.0)
         self.image_embeddings_eps = manager.Value("d", 0.0)
         self.text_embeddings_speed = manager.Value("d", 0.0)

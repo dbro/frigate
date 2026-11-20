@@ -29,6 +29,15 @@ from frigate.util.image import (
 logger = logging.getLogger(__name__)
 
 
+def primary_model_hash(config: FrigateConfig) -> str | None:
+    """MD5 of the first detector's model file, as events/maintainer stores it."""
+    try:
+        detector = next(iter(config.detectors.values()))
+        return detector.model.model_hash if detector.model else None
+    except Exception:
+        return None
+
+
 class CameraState:
     def __init__(
         self,
@@ -37,8 +46,12 @@ class CameraState:
         frame_manager: SharedMemoryFrameManager,
         ptz_autotracker_thread: PtzAutoTrackerThread,
     ) -> None:
+        self.latest_secondlook: dict | None = None
         self.name = name
         self.config = config
+        # the MD5 Frigate stores as Event.model_hash (first detector's model);
+        # config.model, which tracked objects get, has no hash
+        self.primary_model_id = primary_model_hash(config)
         self.camera_config = config.cameras[name]
         self.frame_manager = frame_manager
         self.best_objects: dict[str, TrackedObject] = {}
@@ -377,6 +390,8 @@ class CameraState:
                 self.frame_cache,
                 current_detections[id],
             )
+            if self.primary_model_id:
+                new_obj.primary_model_id = self.primary_model_id
 
             # Skip caching when the frame buffer isn't readable — e.g.
             # frame_manager.get returned None because the SHM segment was
@@ -443,6 +458,13 @@ class CameraState:
                     }
 
                 updated_obj.last_updated = frame_time
+
+            # Secondlook Corrections: keep full-frame JPEG at max-primary hit
+            if (
+                getattr(updated_obj, "save_and_review_needs_frame", False)
+                and current_frame is not None
+            ):
+                updated_obj.capture_save_and_review_frame(current_frame)
 
             # Determine the staleness threshold for publishing updates.
             # Fast-track to 1s for objects in the optimal size range for
