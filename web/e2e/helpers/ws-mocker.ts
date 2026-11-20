@@ -1,3 +1,5 @@
+import { BASE_STATS } from "../fixtures/mock-data/stats";
+import type { FrigateStats } from "../../src/types/stats";
 /**
  * WebSocket mock using Playwright's native page.routeWebSocket().
  *
@@ -10,6 +12,9 @@ import type { Page, WebSocketRoute } from "@playwright/test";
 import { cameraActivityPayload } from "../fixtures/mock-data/camera-activity";
 
 export class WsMocker {
+  public statsOverride?: typeof BASE_STATS & {
+    secondlook?: FrigateStats["secondlook"];
+  };
   private mockWs: WebSocketRoute | null = null;
   private cameras: string[];
 
@@ -42,35 +47,39 @@ export class WsMocker {
       // Send initial stats
       this.send(
         "stats",
-        JSON.stringify({
-          cameras: Object.fromEntries(
-            this.cameras.map((c) => [
-              c,
-              {
-                camera_fps: 5,
-                detection_fps: 5,
-                process_fps: 5,
-                skipped_fps: 0,
-                detection_enabled: 1,
-                connection_quality: "excellent",
-              },
-            ]),
-          ),
-          service: {
-            last_updated: Date.now() / 1000,
-            uptime: 86400,
-            version: "0.15.0-test",
-            latest_version: "0.15.0",
-            storage: {},
+        JSON.stringify(
+          this.statsOverride ?? {
+            processes: {},
+            npu_usages: {},
+            cameras: Object.fromEntries(
+              this.cameras.map((c) => [
+                c,
+                {
+                  camera_fps: 5,
+                  detection_fps: 5,
+                  process_fps: 5,
+                  skipped_fps: 0,
+                  detection_enabled: 1,
+                  connection_quality: "excellent",
+                },
+              ]),
+            ),
+            service: {
+              last_updated: Date.now() / 1000,
+              uptime: 86400,
+              version: "0.15.0-test",
+              latest_version: "0.15.0",
+              storage: {},
+            },
+            detectors: {},
+            cpu_usages: {},
+            gpu_usages: {},
+            camera_fps: 15,
+            process_fps: 15,
+            skipped_fps: 0,
+            detection_fps: 15,
           },
-          detectors: {},
-          cpu_usages: {},
-          gpu_usages: {},
-          camera_fps: 15,
-          process_fps: 15,
-          skipped_fps: 0,
-          detection_fps: 15,
-        }),
+        ),
       );
     }
 
