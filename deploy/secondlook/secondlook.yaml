@@ -1,0 +1,44 @@
+# Merge this into the EXISTING config; do not replace existing detectors/model/cameras.
+# The ONNX model file is not included (see README.md, step 2).
+secondlook:
+  enabled: true
+  device: GPU # OpenVINO device: GPU (Intel iGPU) or CPU
+  model:
+    path: /config/model_cache/secondlook/yolov9-m-640.onnx
+    labelmap_path: /config/model_cache/secondlook/coco80_labelmap.txt
+    input_size: 640
+    # Frigate+ YOLOv9 ONNX instead (local file; labels/size come from its info JSON):
+    # path: /config/model_cache/<model_id>
+    # plus_metadata_path: /config/model_cache/<model_id>.json
+    # or just: path: plus://<model_id> (same two files; never downloaded)
+  no_hit_factor: 0.0
+  min_box_iou: 0.3
+  paired_filters:
+    min_score: 0.3
+  save_and_review:
+    enabled: true
+    database:
+      path: /config/secondlook_examples.db
+    images:
+      path: /media/frigate/clips/secondlook_examples
+    # Optional Corrections display settings (these are the defaults):
+    # review:
+    #   group_gap_seconds: 60
+    #   hide_edge_small: true
+    #   edge_margin_px: 4
+    #   small_dim_fraction: 0.05
+    # Retention cleanup (defaults; 0 or null disables a rule). Accepted
+    # verdicts are never deleted:
+    # retention:
+    #   unreviewed_days: 30
+    #   ignored_days: 7
+    #   max_size_gb: null
+    #   summary_days: 90 # hourly summary
+    #   analyses_days: 90 # per-object analyses (no images)
+# Global settings inherit into cameras. Explicitly disable every non-test camera.
+# Set these under the camera you want to test (using its real name):
+# cameras:
+#   existing_camera:
+#     secondlook:
+#       enabled: true
+#       objects: [person, car]
