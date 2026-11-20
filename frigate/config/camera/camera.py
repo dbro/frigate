@@ -21,6 +21,7 @@ from ..classification import (
     CameraAudioTranscriptionConfig,
     CameraFaceRecognitionConfig,
     CameraLicensePlateRecognitionConfig,
+    CameraSecondlookConfig,
     CameraSemanticSearchConfig,
 )
 from .audio import AudioConfig
@@ -97,6 +98,11 @@ class CameraConfig(FrigateBaseModel):
         default_factory=CameraFaceRecognitionConfig,
         title="Face recognition",
         description="Settings for face detection and recognition for this camera.",
+    )
+    secondlook: CameraSecondlookConfig = Field(
+        default_factory=CameraSecondlookConfig,
+        title="Secondlook",
+        description="Secondlook live score adjustment for tracked objects on this camera.",
     )
     ffmpeg: CameraFfmpegConfig = Field(
         title="Streams (FFmpeg)",

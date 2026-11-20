@@ -59,6 +59,7 @@ from .classification import (
     ClassificationConfig,
     FaceRecognitionConfig,
     LicensePlateRecognitionConfig,
+    SecondlookConfig,
     SemanticSearchConfig,
     SemanticSearchModelEnum,
 )
@@ -419,6 +420,49 @@ def verify_lpr_and_face(
         raise ValueError(
             f"Camera {camera_config.name} has face_recognition enabled but face_recognition is disabled at the global level of the config. You must enable face_recognition at the global level."
         )
+    if camera_config.secondlook.enabled and not frigate_config.secondlook.enabled:
+        raise ValueError(
+            f"Camera {camera_config.name} has secondlook enabled but secondlook is disabled at the global level of the config. You must enable secondlook at the global level."
+        )
+
+
+def apply_secondlook_paired_filters(
+    frigate_config: FrigateConfig, camera_config: CameraConfig
+) -> None:
+    """Normalize camera Secondlook knobs and apply paired admission overrides.
+
+    Stock Frigate defaults are left alone when secondlook is off. Values are
+    starting points for operators to tune (see SecondlookConfig.paired_filters).
+    """
+    camera_config.secondlook._save_and_review_enabled = (
+        frigate_config.secondlook.save_and_review.enabled
+    )
+    camera_config.secondlook._gap_factor_low = frigate_config.secondlook.gap_factor_low
+    camera_config.secondlook._gap_factor_high = frigate_config.secondlook.gap_factor_high
+    if not camera_config.secondlook.enabled:
+        return
+
+    global_sl = frigate_config.secondlook
+    # Ensure the false_positive check and processor see concrete objects + hold/factor knobs even when
+    # exclude_unset skipped global defaults during camera merge.
+    if camera_config.secondlook.objects is None:
+        camera_config.secondlook.objects = list(global_sl.objects)
+    camera_config.secondlook.hold_seconds = global_sl.hold_seconds
+    camera_config.secondlook.factor_min = global_sl.factor_min
+    camera_config.secondlook.factor_max = global_sl.factor_max
+
+    paired = global_sl.paired_filters
+    objects = camera_config.secondlook.objects
+
+    if paired.min_score is not None:
+        for label in objects:
+            filt = camera_config.objects.filters.get(label)
+            if filt is None:
+                continue
+            filt.min_score = paired.min_score
+
+    if paired.min_initialized is not None:
+        camera_config.detect.min_initialized = paired.min_initialized
 
 
 class FrigateConfig(FrigateBaseModel):
@@ -600,6 +644,11 @@ class FrigateConfig(FrigateBaseModel):
         title="License Plate Recognition",
         description="License plate recognition settings including detection thresholds, formatting, and known plates.",
     )
+    secondlook: SecondlookConfig = Field(
+        default_factory=SecondlookConfig,
+        title="Secondlook",
+        description="Secondlook live score adjustment (OpenVINO YOLO crop QA). Disabled by default; no behavior change when off.",
+    )
 
     camera_groups: dict[str, CameraGroupConfig] = Field(
         default_factory=dict,
@@ -706,6 +755,7 @@ class FrigateConfig(FrigateBaseModel):
                 "audio_transcription": ...,
                 "birdseye": ...,
                 "face_recognition": ...,
+                "secondlook": ...,
                 "lpr": ...,
                 "record": ...,
                 "snapshots": ...,
@@ -766,6 +816,13 @@ class FrigateConfig(FrigateBaseModel):
             # only populate some fields down to the camera level for specific keys
             allowed_fields_map = {
                 "face_recognition": ["enabled", "min_area"],
+                "secondlook": [
+                    "enabled",
+                    "objects",
+                    "hold_seconds",
+                    "factor_min",
+                    "factor_max",
+                ],
                 "lpr": ["enabled", "expire_time", "min_area", "enhancement"],
                 "audio_transcription": ["enabled", "live_enabled"],
             }
@@ -1007,6 +1064,7 @@ class FrigateConfig(FrigateBaseModel):
             verify_motion_and_detect(camera_config)
             verify_objects_track(camera_config, labelmap_objects)
             verify_lpr_and_face(self, camera_config)
+            apply_secondlook_paired_filters(self, camera_config)
 
         # Validate camera profiles reference top-level profile definitions
         for cam_name, cam_config in self.cameras.items():
