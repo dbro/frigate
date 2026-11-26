@@ -580,13 +580,155 @@ class TestReviewTrustAPI(unittest.TestCase):
             ],
         )
 
-        rows = self.trust_store.get_timings_in_range(5999.0, 6002.0)
+        rows = self.trust_store.get_timings_in_range(5999.0, 6002.0, severity="alert")
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["review_id"], segment.id)
+        self.assertEqual(rows[0]["severity"], "alert")
         self.assertAlmostEqual(rows[0]["discovery_ms"], 0.0)
         self.assertAlmostEqual(rows[0]["resource_busy_ms"], 27.5)
         self.assertAlmostEqual(rows[0]["confirmation_ms"], 500.0)
         self.assertAlmostEqual(rows[0]["total_ms"], 527.5)
+
+    def test_detection_timing_zero_confirmation_and_outlier_guard(self) -> None:
+        maintainer = ReviewSegmentMaintainer.__new__(ReviewSegmentMaintainer)
+        maintainer.trust_store = self.trust_store
+        end_ts = 1_700_000_000.0
+        t = end_ts - 600.0
+
+        # Detection segment must always record confirmation_ms=0.0
+        det_seg = PendingReviewSegment(
+            camera="front_door",
+            frame_time=t,
+            severity=SeverityEnum.detection,
+            detections={"obj-det": "cat"},
+            sub_labels={},
+            zones=[],
+            audio=set(),
+        )
+        maintainer._record_alert_timing(
+            det_seg,
+            alert_time=t,
+            alert_objects=[
+                {
+                    "id": "obj-det",
+                    "start_time": t - 1.5,
+                    "accumulated_resource_busy_ms": 42.0,
+                }
+            ],
+            severity="detection",
+        )
+
+        # Stationary object reactivated after 700s uses last_active_time (0.4s)
+        reactivated_seg = PendingReviewSegment(
+            camera="front_door",
+            frame_time=t + 10.0,
+            severity=SeverityEnum.alert,
+            detections={"obj-car": "car"},
+            sub_labels={},
+            zones=["driveway"],
+            audio=set(),
+        )
+        maintainer._record_alert_timing(
+            reactivated_seg,
+            alert_time=t + 10.0,
+            alert_objects=[
+                {
+                    "id": "obj-car",
+                    "start_time": t - 700.0,
+                    "last_active_time": t + 9.6,
+                    "accumulated_resource_busy_ms": 18.0,
+                }
+            ],
+            severity="alert",
+        )
+
+        # Stale >30s track with no confirmed_time or recent last_active_time is skipped
+        stale_seg = PendingReviewSegment(
+            camera="front_door",
+            frame_time=t + 20.0,
+            severity=SeverityEnum.alert,
+            detections={"obj-stale": "car"},
+            sub_labels={},
+            zones=["driveway"],
+            audio=set(),
+        )
+        maintainer._record_alert_timing(
+            stale_seg,
+            alert_time=t + 20.0,
+            alert_objects=[
+                {
+                    "id": "obj-stale",
+                    "start_time": t - 750.0,
+                    "accumulated_resource_busy_ms": 10.0,
+                }
+            ],
+            severity="alert",
+        )
+
+        # Simulate a legacy pre-fix 720s outlier already in review_trust.db
+        self.trust_store.record_alert_timing(
+            review_id="legacy-720s",
+            camera="front_door",
+            alert_time=t + 30.0,
+            discovery_ms=0.0,
+            resource_busy_ms=20.0,
+            confirmation_ms=720_000.0,
+            severity="alert",
+        )
+
+        # Alert overview ignores legacy 720s outlier and sees only reactivated_seg (400ms)
+        alert_body = self.client.get(
+            "/review/overview", params={"severity": "alert", "end_time": end_ts}
+        ).json()
+        alert_timing = alert_body["buckets"][29]["timing"]
+        self.assertEqual(alert_timing["count"], 1)
+        self.assertAlmostEqual(alert_timing["avg_confirmation_ms"], 400.0, places=1)
+        self.assertAlmostEqual(alert_timing["avg_resource_busy_ms"], 18.0, places=1)
+        self.assertEqual(alert_timing["slowest_review_id"], reactivated_seg.id)
+
+        # Detection overview sees det_seg with confirmation_ms == 0.0
+        det_body = self.client.get(
+            "/review/overview", params={"severity": "detection", "end_time": end_ts}
+        ).json()
+        det_timing = det_body["buckets"][29]["timing"]
+        self.assertEqual(det_timing["count"], 1)
+        self.assertAlmostEqual(det_timing["avg_confirmation_ms"], 0.0)
+        self.assertAlmostEqual(det_timing["avg_resource_busy_ms"], 42.0)
+        self.assertAlmostEqual(det_timing["avg_total_ms"], 42.0)
+
+    def test_legacy_db_migrates_alert_timings_severity_column(self) -> None:
+        import sqlite3
+
+        legacy_path = os.path.join(self.tmp.name, "legacy_trust.db")
+        with sqlite3.connect(legacy_path) as conn:
+            conn.execute(
+                """
+                CREATE TABLE alert_timings (
+                    review_id TEXT PRIMARY KEY,
+                    camera TEXT NOT NULL,
+                    alert_time REAL NOT NULL,
+                    discovery_ms REAL NOT NULL DEFAULT 0.0,
+                    resource_busy_ms REAL NOT NULL DEFAULT 0.0,
+                    confirmation_ms REAL NOT NULL DEFAULT 0.0,
+                    total_ms REAL NOT NULL DEFAULT 0.0
+                )
+                """
+            )
+            conn.execute(
+                """
+                INSERT INTO alert_timings (
+                    review_id, camera, alert_time, discovery_ms,
+                    resource_busy_ms, confirmation_ms, total_ms
+                ) VALUES ('old-1', 'front_door', 1000.0, 0.0, 15.0, 300.0, 315.0)
+                """
+            )
+            conn.commit()
+
+        migrated = ReviewTrustStore(legacy_path, os.path.join(self.tmp.name, "exp2"))
+        rows = migrated.get_timings_in_range(900.0, 1100.0, severity="alert")
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["review_id"], "old-1")
+        self.assertEqual(rows[0]["severity"], "alert")
 
 
 if __name__ == "__main__":

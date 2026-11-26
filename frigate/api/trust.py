@@ -24,6 +24,7 @@ from frigate.const import EXPORT_DIR
 from frigate.models import Event, Recordings, ReviewSegment, UserReviewStatus
 from frigate.record.export import PlaybackSourceEnum, RecordingExporter
 from frigate.review.trust_store import (
+    MAX_VALID_TIMING_MS,
     VALID_GOLDEN_KINDS,
     VALID_VERDICTS,
     ReviewTrustStore,
@@ -511,15 +512,31 @@ async def get_review_overview(
         if clip["severity"] == severity or clip["kind"] == "background":
             buckets[idx]["golden_clips"].append(clip)
 
-    # Alert timings per bucket (averages + slowest)
+    # Alert / detection timings per bucket (averages + slowest).
+    # Filter by severity, force confirmation_ms=0 on detection view, and skip
+    # pre-fix legacy outlier rows exceeding MAX_VALID_TIMING_MS (30s).
     timings = trust_store.get_timings_in_range(
-        window_start, resolved_end, cameras=camera_list
+        window_start, resolved_end, cameras=camera_list, severity=severity
     )
     timings_by_bucket: dict[int, list[dict[str, Any]]] = {}
     for row in timings:
+        disc_ms = max(0.0, float(row["discovery_ms"]))
+        busy_ms = max(0.0, float(row["resource_busy_ms"]))
+        conf_ms = 0.0 if severity == "detection" else max(0.0, float(row["confirmation_ms"]))
+        total_ms = disc_ms + busy_ms + conf_ms
+        if total_ms > MAX_VALID_TIMING_MS:
+            continue
         idx = _bucket_index(float(row["alert_time"]), window_start, bar_seconds)
         if idx is not None:
-            timings_by_bucket.setdefault(idx, []).append(row)
+            timings_by_bucket.setdefault(idx, []).append(
+                {
+                    "review_id": row["review_id"],
+                    "discovery_ms": disc_ms,
+                    "resource_busy_ms": busy_ms,
+                    "confirmation_ms": conf_ms,
+                    "total_ms": total_ms,
+                }
+            )
 
     for idx, rows_in_bucket in timings_by_bucket.items():
         n = len(rows_in_bucket)

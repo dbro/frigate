@@ -1,5 +1,6 @@
 import {
   MouseEvent as ReactMouseEvent,
+  ReactNode,
   useCallback,
   useEffect,
   useMemo,
@@ -16,6 +17,7 @@ import {
   ReviewOverviewBarSize,
   ReviewOverviewResponse,
   ReviewOverviewSeverity,
+  TrustCategoryFilter,
   TrustOverviewBucket,
 } from "@/types/reviewTrust";
 import GoldenClipsDialog from "./GoldenClipsDialog";
@@ -65,6 +67,24 @@ const BAR_SIZE_OPTIONS: {
 ];
 
 const NUM_BARS = 30;
+const NICE_TIMING_STEPS = [2.5, 3, 4, 5, 6, 8, 10, 12, 15, 20, 25, 30];
+
+function computeNiceTimingMax(rawMaxSec: number): number {
+  const bounded = Math.max(2.5, rawMaxSec);
+  for (const step of NICE_TIMING_STEPS) {
+    if (bounded <= step) {
+      return step;
+    }
+  }
+  return Math.ceil(bounded / 5) * 5;
+}
+
+function formatTimingTick(sec: number): string {
+  if (sec >= 10 && Math.abs(sec - Math.round(sec)) < 0.01) {
+    return `${Math.round(sec)}s`;
+  }
+  return `${sec.toFixed(1)}s`;
+}
 
 type HoverState =
   | {
@@ -172,9 +192,13 @@ type ReviewTrustOverviewProps = {
   filter?: ReviewFilter;
   showReviewed: boolean;
   selectedTimeRange?: { start: number; end: number } | null;
+  activeCategory?: TrustCategoryFilter | null;
+  openGoldenDialogSignal?: number;
+  onSelectCategory?: (category: TrustCategoryFilter | null) => void;
   onSelectTimeRange?: (start: number, end: number) => void;
   onOpenReviewId?: (reviewId: string) => void;
   onGoldenClipClick?: (clip: GoldenClipSummary) => void;
+  onGoldenReviewIdsChange?: (reviewIds: Set<string>) => void;
   onFeedbackMapChange?: (
     feedbackByReviewId: Record<string, ReviewFeedbackItem>,
   ) => void;
@@ -186,9 +210,13 @@ export default function ReviewTrustOverview({
   filter,
   showReviewed,
   selectedTimeRange,
+  activeCategory: controlledActiveCategory,
+  openGoldenDialogSignal,
+  onSelectCategory,
   onSelectTimeRange,
   onOpenReviewId,
   onGoldenClipClick,
+  onGoldenReviewIdsChange,
   onFeedbackMapChange,
   onUnreviewedFnCountChange,
 }: ReviewTrustOverviewProps) {
@@ -196,6 +224,32 @@ export default function ReviewTrustOverview({
   const [timingExpanded, setTimingExpanded] = useState(false);
   const [goldenDialogOpen, setGoldenDialogOpen] = useState(false);
   const [hover, setHover] = useState<HoverState>(null);
+  const [internalActiveCategory, setInternalActiveCategory] =
+    useState<TrustCategoryFilter | null>(null);
+
+  const activeCategory =
+    controlledActiveCategory !== undefined
+      ? controlledActiveCategory
+      : internalActiveCategory;
+
+  const handleToggleCategory = useCallback(
+    (category: TrustCategoryFilter | null) => {
+      const next =
+        category !== null && activeCategory === category ? null : category;
+      if (onSelectCategory) {
+        onSelectCategory(next);
+      } else {
+        setInternalActiveCategory(next);
+      }
+    },
+    [activeCategory, onSelectCategory],
+  );
+
+  useEffect(() => {
+    if (openGoldenDialogSignal && openGoldenDialogSignal > 0) {
+      setGoldenDialogOpen(true);
+    }
+  }, [openGoldenDialogSignal]);
 
   const queryParams = useMemo(() => {
     const params: Record<string, string | number | boolean> = {
@@ -266,6 +320,21 @@ export default function ReviewTrustOverview({
     return createEmptyBuckets(barSize);
   }, [data?.buckets, barSize]);
 
+  useEffect(() => {
+    if (!onGoldenReviewIdsChange) {
+      return;
+    }
+    const ids = new Set<string>();
+    for (const bucket of buckets) {
+      for (const clip of bucket.golden_clips ?? []) {
+        if (clip.review_id) {
+          ids.add(clip.review_id);
+        }
+      }
+    }
+    onGoldenReviewIdsChange(ids);
+  }, [buckets, onGoldenReviewIdsChange]);
+
   const barMeta = useMemo(
     () =>
       BAR_SIZE_OPTIONS.find((opt) => opt.value === barSize) ??
@@ -326,14 +395,22 @@ export default function ReviewTrustOverview({
   const timingPadB = 24;
   const timingPlotH = timingH - timingPadT - timingPadB;
   const maxTimingSec = useMemo(() => {
-    let maxSlowest = 2.5;
+    let rawMax = 2.5;
     for (const b of buckets) {
-      const slowestSec = b.timing.slowest_ms / 1000;
-      const totalSec = b.timing.avg_total_ms / 1000;
-      maxSlowest = Math.max(maxSlowest, slowestSec, totalSec);
+      const discSec = (b.timing.avg_discovery_ms ?? 0) / 1000;
+      const busySec = (b.timing.avg_resource_busy_ms ?? 0) / 1000;
+      const confSec = isAlerts ? (b.timing.avg_confirmation_ms ?? 0) / 1000 : 0;
+      const avgTotalSec = discSec + busySec + confSec;
+      const slowestSec = (b.timing.slowest_ms ?? 0) / 1000;
+      rawMax = Math.max(rawMax, slowestSec, avgTotalSec);
     }
-    return Math.ceil(maxSlowest * 2) / 2;
-  }, [buckets]);
+    return computeNiceTimingMax(rawMax);
+  }, [buckets, isAlerts]);
+
+  const timingTicks = useMemo(
+    () => [0, maxTimingSec / 2, maxTimingSec],
+    [maxTimingSec],
+  );
 
   const handleBarMove = useCallback(
     (evt: ReactMouseEvent<SVGGElement>, bucket: TrustOverviewBucket) => {
@@ -455,88 +532,160 @@ export default function ReviewTrustOverview({
               </div>
             </div>
 
-            {/* Two-row Legend */}
-            {isAlerts ? (
-              <div className="flex flex-col items-start gap-1 text-[11px] sm:items-end">
-                <div className="flex flex-wrap items-center gap-2.5">
-                  <span className="font-medium text-muted-foreground">
-                    Above (Auto):
-                  </span>
-                  <span className="inline-flex items-center gap-1">
-                    <span className="size-2.5 rounded-sm bg-blue-500" />
-                    Alerts
-                  </span>
-                  <span className="inline-flex items-center gap-1">
-                    <span className="size-2.5 rounded-sm bg-teal-400" />
-                    Rescued FN
-                  </span>
-                  <span className="inline-flex items-center gap-1">
-                    <span className="size-2.5 rounded-sm bg-yellow-400" />
-                    Misclassified
-                  </span>
+            {/* Two-row Clickable Legend (click any item to filter) */}
+            {(() => {
+              const renderLegendBtn = (
+                category: TrustCategoryFilter,
+                label: string,
+                swatch: ReactNode,
+                extraClass?: string,
+              ) => {
+                const isActive = activeCategory === category;
+                const isDimmed =
+                  activeCategory !== null && activeCategory !== category;
+                return (
+                  <button
+                    key={category}
+                    type="button"
+                    aria-pressed={isActive}
+                    title={
+                      isActive ? `Clear ${label} filter` : `Filter by ${label}`
+                    }
+                    onClick={() => handleToggleCategory(category)}
+                    className={cn(
+                      "inline-flex cursor-pointer items-center gap-1 rounded-md px-1.5 py-0.5 transition",
+                      isActive
+                        ? "bg-primary/15 font-semibold text-foreground ring-1 ring-primary/60"
+                        : isDimmed
+                          ? "opacity-45 hover:bg-muted/70 hover:opacity-100"
+                          : "hover:bg-muted/70",
+                      extraClass,
+                    )}
+                  >
+                    {swatch}
+                    <span>{label}</span>
+                  </button>
+                );
+              };
+
+              return isAlerts ? (
+                <div className="flex flex-col items-start gap-1 text-[11px] sm:items-end">
+                  <div className="flex flex-wrap items-center gap-1.5">
+                    <span className="mr-0.5 font-medium text-muted-foreground">
+                      Above (Auto):
+                    </span>
+                    {renderLegendBtn(
+                      "alerts",
+                      "Alerts",
+                      <span className="size-2.5 rounded-sm bg-blue-500" />,
+                    )}
+                    {renderLegendBtn(
+                      "rescued_fn",
+                      "Rescued FN",
+                      <span className="size-2.5 rounded-sm bg-teal-400" />,
+                    )}
+                    {renderLegendBtn(
+                      "auto_misclassified",
+                      "Misclassified",
+                      <span className="size-2.5 rounded-sm bg-yellow-400" />,
+                    )}
+                  </div>
+                  <div className="flex flex-wrap items-center gap-1.5">
+                    <span className="mr-0.5 font-medium text-muted-foreground">
+                      Below (Human-Edited):
+                    </span>
+                    {renderLegendBtn(
+                      "fp",
+                      "FP",
+                      <span className="size-2.5 rounded-sm bg-rose-500" />,
+                    )}
+                    {renderLegendBtn(
+                      "human_misclassified",
+                      "Misclassified",
+                      <span className="size-2.5 rounded-sm bg-yellow-400" />,
+                    )}
+                    {renderLegendBtn(
+                      "golden",
+                      "Golden Clip",
+                      <span>🏆</span>,
+                      "ml-0.5 text-amber-500 dark:text-amber-400",
+                    )}
+                    {activeCategory !== null && (
+                      <button
+                        type="button"
+                        onClick={() => handleToggleCategory(null)}
+                        className="ml-1 rounded-md border border-border px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground transition hover:bg-muted hover:text-foreground"
+                      >
+                        Clear ×
+                      </button>
+                    )}
+                  </div>
                 </div>
-                <div className="flex flex-wrap items-center gap-2.5">
-                  <span className="font-medium text-muted-foreground">
-                    Below (Human-Edited):
-                  </span>
-                  <span className="inline-flex items-center gap-1">
-                    <span className="size-2.5 rounded-sm bg-rose-500" />
-                    FP
-                  </span>
-                  <span className="inline-flex items-center gap-1">
-                    <span className="size-2.5 rounded-sm bg-yellow-400" />
-                    Misclassified
-                  </span>
-                  <span className="ml-1 inline-flex items-center gap-1 text-amber-400">
-                    🏆 Golden Clip
-                  </span>
+              ) : (
+                <div className="flex flex-col items-start gap-1 text-[11px] sm:items-end">
+                  <div className="flex flex-wrap items-center gap-1.5">
+                    <span className="mr-0.5 font-medium text-muted-foreground">
+                      Above (Auto):
+                    </span>
+                    {renderLegendBtn(
+                      "detections",
+                      "Detections",
+                      <span className="size-2.5 rounded-sm bg-slate-500" />,
+                    )}
+                    {renderLegendBtn(
+                      "auto_suppressed_fp",
+                      "Auto-Suppressed FP",
+                      <span className="size-2.5 rounded-sm bg-rose-400/80" />,
+                    )}
+                    {renderLegendBtn(
+                      "auto_misclassified",
+                      "Misclassified",
+                      <span className="size-2.5 rounded-sm bg-yellow-400" />,
+                    )}
+                    {renderLegendBtn(
+                      "background_clips",
+                      "Background Clips",
+                      <span className="size-2.5 rounded-sm border border-foreground/60 bg-transparent" />,
+                    )}
+                  </div>
+                  <div className="flex flex-wrap items-center gap-1.5">
+                    <span className="mr-0.5 font-medium text-muted-foreground">
+                      Below (Human-Edited):
+                    </span>
+                    {renderLegendBtn(
+                      "fn",
+                      "FN",
+                      <span className="size-2.5 rounded-sm bg-red-600" />,
+                    )}
+                    {renderLegendBtn(
+                      "fp",
+                      "FP",
+                      <span className="size-2.5 rounded-sm bg-rose-500" />,
+                    )}
+                    {renderLegendBtn(
+                      "human_misclassified",
+                      "Misclassified",
+                      <span className="size-2.5 rounded-sm bg-yellow-400" />,
+                    )}
+                    {renderLegendBtn(
+                      "golden",
+                      "Golden Clip",
+                      <span>🏆</span>,
+                      "ml-0.5 text-amber-500 dark:text-amber-400",
+                    )}
+                    {activeCategory !== null && (
+                      <button
+                        type="button"
+                        onClick={() => handleToggleCategory(null)}
+                        className="ml-1 rounded-md border border-border px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground transition hover:bg-muted hover:text-foreground"
+                      >
+                        Clear ×
+                      </button>
+                    )}
+                  </div>
                 </div>
-              </div>
-            ) : (
-              <div className="flex flex-col items-start gap-1 text-[11px] sm:items-end">
-                <div className="flex flex-wrap items-center gap-2.5">
-                  <span className="font-medium text-muted-foreground">
-                    Above (Auto):
-                  </span>
-                  <span className="inline-flex items-center gap-1">
-                    <span className="size-2.5 rounded-sm bg-slate-500" />
-                    Detections
-                  </span>
-                  <span className="inline-flex items-center gap-1">
-                    <span className="size-2.5 rounded-sm bg-rose-400/80" />
-                    Auto-Suppressed FP
-                  </span>
-                  <span className="inline-flex items-center gap-1">
-                    <span className="size-2.5 rounded-sm bg-yellow-400" />
-                    Misclassified
-                  </span>
-                  <span className="inline-flex items-center gap-1">
-                    <span className="size-2.5 rounded-sm border border-slate-200 bg-transparent" />
-                    Background Clips
-                  </span>
-                </div>
-                <div className="flex flex-wrap items-center gap-2.5">
-                  <span className="font-medium text-muted-foreground">
-                    Below (Human-Edited):
-                  </span>
-                  <span className="inline-flex items-center gap-1">
-                    <span className="size-2.5 rounded-sm bg-red-600" />
-                    FN
-                  </span>
-                  <span className="inline-flex items-center gap-1">
-                    <span className="size-2.5 rounded-sm bg-rose-500" />
-                    FP
-                  </span>
-                  <span className="inline-flex items-center gap-1">
-                    <span className="size-2.5 rounded-sm bg-yellow-400" />
-                    Misclassified
-                  </span>
-                  <span className="ml-1 inline-flex items-center gap-1 text-amber-400">
-                    🏆 Golden Clip
-                  </span>
-                </div>
-              </div>
-            )}
+              );
+            })()}
           </div>
         </div>
 
@@ -611,32 +760,47 @@ export default function ReviewTrustOverview({
                 selectedTimeRange.start === bucket.start_time &&
                 selectedTimeRange.end === bucket.end_time;
 
-              const upSegments = isAlerts
+              const upSegments: {
+                category: TrustCategoryFilter;
+                val: number;
+                color: string;
+                outline?: string;
+              }[] = isAlerts
                 ? [
                     {
+                      category: "alerts",
                       val: bucket.above.alerts ?? bucket.above.tp ?? 0,
                       color: "#3b82f6",
                     },
-                    { val: bucket.above.rescued_fn ?? 0, color: "#2dd4bf" },
                     {
+                      category: "rescued_fn",
+                      val: bucket.above.rescued_fn ?? 0,
+                      color: "#2dd4bf",
+                    },
+                    {
+                      category: "auto_misclassified",
                       val: bucket.above.auto_misclassified ?? 0,
                       color: "#facc15",
                     },
                   ]
                 : [
                     {
+                      category: "detections",
                       val: bucket.above.detections ?? bucket.above.tp ?? 0,
                       color: "#64748b",
                     },
                     {
+                      category: "auto_suppressed_fp",
                       val: bucket.above.auto_suppressed_fp ?? 0,
                       color: "#e17087",
                     },
                     {
+                      category: "auto_misclassified",
                       val: bucket.above.auto_misclassified ?? 0,
                       color: "#facc15",
                     },
                     {
+                      category: "background_clips",
                       val: bucket.above.background_clips ?? 0,
                       color: "transparent",
                       outline: "currentColor",
@@ -651,6 +815,8 @@ export default function ReviewTrustOverview({
                   const clampedTop = Math.max(padT, curUpY - rawH);
                   const h = Math.max(0, curUpY - clampedTop);
                   curUpY = clampedTop;
+                  const dimmed =
+                    activeCategory !== null && activeCategory !== seg.category;
                   return (
                     <rect
                       key={`up-${segIdx}`}
@@ -660,32 +826,51 @@ export default function ReviewTrustOverview({
                       height={h}
                       rx={1.5}
                       fill={seg.color}
-                      stroke={"outline" in seg ? seg.outline : undefined}
-                      strokeOpacity={"outline" in seg ? 0.65 : undefined}
-                      strokeWidth={"outline" in seg ? 1.5 : undefined}
+                      fillOpacity={seg.outline ? undefined : dimmed ? 0.16 : 1}
+                      stroke={seg.outline}
+                      strokeOpacity={
+                        seg.outline ? (dimmed ? 0.16 : 0.75) : undefined
+                      }
+                      strokeWidth={seg.outline ? 1.5 : undefined}
                     />
                   );
                 });
               const topOfBarY = curUpY;
 
-              const downSegments = isAlerts
+              const downSegments: {
+                category: TrustCategoryFilter;
+                val: number;
+                color: string;
+              }[] = isAlerts
                 ? [
-                    { val: bucket.below.fp, color: "#f43f5e" },
-                    { val: bucket.below.misclassified, color: "#facc15" },
+                    { category: "fp", val: bucket.below.fp, color: "#f43f5e" },
+                    {
+                      category: "human_misclassified",
+                      val: bucket.below.misclassified,
+                      color: "#facc15",
+                    },
                   ]
                 : [
-                    { val: bucket.below.fn, color: "#dc2626" },
-                    { val: bucket.below.fp, color: "#f43f5e" },
-                    { val: bucket.below.misclassified, color: "#facc15" },
+                    { category: "fn", val: bucket.below.fn, color: "#dc2626" },
+                    { category: "fp", val: bucket.below.fp, color: "#f43f5e" },
+                    {
+                      category: "human_misclassified",
+                      val: bucket.below.misclassified,
+                      color: "#facc15",
+                    },
                   ];
 
               let curDownY = zeroY;
               const downRects = downSegments
                 .filter((seg) => seg.val > 0)
                 .map((seg, segIdx) => {
-                  const h = Math.max(2, (seg.val / niceDown) * downH);
+                  const rawH = Math.max(2, (seg.val / niceDown) * downH);
+                  const clampedBottom = Math.min(H - padB, curDownY + rawH);
+                  const h = Math.max(0, clampedBottom - curDownY);
                   const rectY = curDownY;
-                  curDownY += h;
+                  curDownY = clampedBottom;
+                  const dimmed =
+                    activeCategory !== null && activeCategory !== seg.category;
                   return (
                     <rect
                       key={`down-${segIdx}`}
@@ -695,6 +880,7 @@ export default function ReviewTrustOverview({
                       height={h}
                       rx={1.5}
                       fill={seg.color}
+                      fillOpacity={dimmed ? 0.16 : 1}
                     />
                   );
                 });
@@ -703,6 +889,8 @@ export default function ReviewTrustOverview({
               const hitBottom = Math.max(zeroY + 12, curDownY);
               const firstGolden = bucket.golden_clips?.[0];
               const pinY = Math.max(14, topOfBarY - 12);
+              const goldenDimmed =
+                activeCategory !== null && activeCategory !== "golden";
 
               return (
                 <g key={bucket.index}>
@@ -746,6 +934,7 @@ export default function ReviewTrustOverview({
                   {firstGolden && (
                     <g
                       className="cursor-pointer transition-transform hover:-translate-y-0.5"
+                      opacity={goldenDimmed ? 0.2 : 1}
                       onMouseMove={(e) =>
                         handleGoldenMove(e, bucket, firstGolden)
                       }
@@ -801,7 +990,7 @@ export default function ReviewTrustOverview({
         </div>
       </div>
 
-      {/* Collapsible Alert Timing Accordion (collapsed by default) */}
+      {/* Collapsible Alert / Detection Timing Accordion (collapsed by default) */}
       <div className="overflow-hidden rounded-xl border border-border bg-card">
         <button
           type="button"
@@ -814,11 +1003,12 @@ export default function ReviewTrustOverview({
               {timingExpanded ? "▾" : "▸"}
             </span>
             <span className="text-sm font-medium text-foreground">
-              Alert Timing
+              {isAlerts ? "Alert Timing" : "Detection Timing"}
             </span>
             <span className="text-xs text-muted-foreground">
-              (Alerted events · Avg Discovery + Resource Busy + Confirmation vs
-              2.0s Goal)
+              {isAlerts
+                ? "(Alerted events · Avg Discovery + Resource Busy + Confirmation vs 2.0s Goal)"
+                : "(Detected events · Avg Discovery + Resource Busy vs 2.0s Goal)"}
             </span>
           </div>
           <div className="hidden items-center gap-3 text-xs text-muted-foreground sm:flex">
@@ -830,10 +1020,12 @@ export default function ReviewTrustOverview({
               <span className="size-2.5 rounded-sm bg-amber-500" />
               Resource Busy
             </span>
-            <span className="inline-flex items-center gap-1">
-              <span className="size-2.5 rounded-sm bg-violet-500" />
-              Confirmation
-            </span>
+            {isAlerts && (
+              <span className="inline-flex items-center gap-1">
+                <span className="size-2.5 rounded-sm bg-violet-500" />
+                Confirmation
+              </span>
+            )}
             <span className="inline-flex items-center gap-1">
               <span className="size-2 rounded-full bg-cyan-400" />
               Slowest
@@ -847,51 +1039,65 @@ export default function ReviewTrustOverview({
               className="w-full select-none overflow-visible"
               viewBox={`0 0 ${W} ${timingH}`}
             >
-              {[0, 1.0, 2.0].map((sec) => {
+              {/* Dynamic Y-axis gridlines & labels */}
+              {timingTicks.map((sec, tIdx) => {
                 const y =
                   timingPadT + timingPlotH - (sec / maxTimingSec) * timingPlotH;
-                const isGoal = sec === 2.0;
                 return (
-                  <g key={`timing-grid-${sec}`}>
+                  <g key={`timing-grid-${tIdx}`}>
                     <line
                       x1={padL}
                       x2={W - padR}
                       y1={y}
                       y2={y}
                       stroke="currentColor"
-                      strokeOpacity={isGoal ? 0.5 : 0.12}
-                      strokeDasharray={isGoal ? "5 4" : undefined}
+                      strokeOpacity={sec === 0 ? 0.35 : 0.12}
                     />
                     <text
                       x={padL - 8}
                       y={y + 4}
                       textAnchor="end"
                       fill="currentColor"
-                      fillOpacity={0.65}
+                      fillOpacity={0.7}
                       fontSize={11}
                     >
-                      {sec.toFixed(1)}s
+                      {formatTimingTick(sec)}
                     </text>
                   </g>
                 );
               })}
 
-              {/* 2.0s Goal label */}
-              <text
-                x={W - padR - 4}
-                y={
-                  timingPadT +
-                  timingPlotH -
-                  (2.0 / maxTimingSec) * timingPlotH -
-                  5
-                }
-                textAnchor="end"
-                fill="currentColor"
-                fillOpacity={0.7}
-                fontSize={10}
-              >
-                2.0s Goal
-              </text>
+              {/* 2.0s Goal dashed reference line & label */}
+              {2.0 <= maxTimingSec &&
+                (() => {
+                  const goalY =
+                    timingPadT +
+                    timingPlotH -
+                    (2.0 / maxTimingSec) * timingPlotH;
+                  return (
+                    <g>
+                      <line
+                        x1={padL}
+                        x2={W - padR}
+                        y1={goalY}
+                        y2={goalY}
+                        stroke="currentColor"
+                        strokeOpacity={0.5}
+                        strokeDasharray="5 4"
+                      />
+                      <text
+                        x={W - padR - 4}
+                        y={Math.max(timingPadT + 10, goalY - 4)}
+                        textAnchor="end"
+                        fill="currentColor"
+                        fillOpacity={0.75}
+                        fontSize={10}
+                      >
+                        2.0s Goal
+                      </text>
+                    </g>
+                  );
+                })()}
 
               {!buckets.some((b) => (b.timing?.count ?? 0) > 0) && (
                 <text
@@ -899,11 +1105,12 @@ export default function ReviewTrustOverview({
                   y={timingPadT + timingPlotH / 2 + 4}
                   textAnchor="middle"
                   fill="currentColor"
-                  fillOpacity={0.5}
+                  fillOpacity={0.55}
                   fontSize={12}
                 >
-                  No alert timing samples in this window yet — recorded live for
-                  new alerts
+                  {isAlerts
+                    ? "No alert timing samples in this window yet (recorded live for new alerts)"
+                    : "No detection timing samples in this window yet (recorded live for new detections)"}
                 </text>
               )}
 
@@ -914,21 +1121,33 @@ export default function ReviewTrustOverview({
 
                 const discSec = bucket.timing.avg_discovery_ms / 1000;
                 const busySec = bucket.timing.avg_resource_busy_ms / 1000;
-                const confSec = bucket.timing.avg_confirmation_ms / 1000;
+                const confSec = isAlerts
+                  ? bucket.timing.avg_confirmation_ms / 1000
+                  : 0;
                 const slowestSec = bucket.timing.slowest_ms / 1000;
 
                 let curY = timingPadT + timingPlotH;
-                const segs = [
-                  { sec: discSec, color: "#64748b" },
-                  { sec: busySec, color: "#f59e0b" },
-                  { sec: confSec, color: "#8b5cf6" },
-                ];
+                const segs = isAlerts
+                  ? [
+                      { sec: discSec, color: "#64748b" },
+                      { sec: busySec, color: "#f59e0b" },
+                      { sec: confSec, color: "#8b5cf6" },
+                    ]
+                  : [
+                      { sec: discSec, color: "#64748b" },
+                      { sec: busySec, color: "#f59e0b" },
+                    ];
 
-                const slowestY =
-                  timingPadT +
-                  timingPlotH -
-                  (Math.min(maxTimingSec - 0.05, slowestSec) / maxTimingSec) *
-                    timingPlotH;
+                const slowestY = Math.max(
+                  timingPadT + 3,
+                  Math.min(
+                    timingPadT + timingPlotH - 3,
+                    timingPadT +
+                      timingPlotH -
+                      (Math.min(maxTimingSec, slowestSec) / maxTimingSec) *
+                        timingPlotH,
+                  ),
+                );
 
                 return (
                   <g key={`timing-${bucket.index}`}>
@@ -947,11 +1166,13 @@ export default function ReviewTrustOverview({
                         }}
                       >
                         {segs.map((seg, sIdx) => {
-                          const h = Math.max(
+                          const rawH = Math.max(
                             0,
                             (seg.sec / maxTimingSec) * timingPlotH,
                           );
-                          curY -= h;
+                          const clampedTop = Math.max(timingPadT, curY - rawH);
+                          const h = Math.max(0, curY - clampedTop);
+                          curY = clampedTop;
                           return h > 0 ? (
                             <rect
                               key={sIdx}
@@ -1010,7 +1231,7 @@ export default function ReviewTrustOverview({
                   🏆
                 </div>
                 <div className="min-w-0">
-                  <div className="font-semibold text-amber-400">
+                  <div className="font-semibold text-amber-500 dark:text-amber-400">
                     Golden Clip · {hover.clip.id}
                   </div>
                   <div className="truncate font-medium text-foreground">
@@ -1022,7 +1243,7 @@ export default function ReviewTrustOverview({
                       ? ` · ${hover.clip.object_label}`
                       : ""}
                   </div>
-                  <div className="mt-0.5 text-blue-400">
+                  <div className="mt-0.5 text-blue-500 dark:text-blue-400">
                     Kind: {hover.clip.kind} · Click to open →
                   </div>
                 </div>
@@ -1040,19 +1261,23 @@ export default function ReviewTrustOverview({
               {isAlerts ? (
                 <div className="space-y-0.5">
                   <div className="flex justify-between gap-4">
-                    <span className="text-blue-400">Alerts (Auto)</span>
+                    <span className="text-blue-500 dark:text-blue-400">
+                      Alerts (Auto)
+                    </span>
                     <span className="font-mono font-semibold">
                       {hover.bucket.above.alerts}
                     </span>
                   </div>
                   <div className="flex justify-between gap-4">
-                    <span className="text-teal-400">Rescued FN (Auto)</span>
+                    <span className="text-teal-500 dark:text-teal-400">
+                      Rescued FN (Auto)
+                    </span>
                     <span className="font-mono font-semibold">
                       {hover.bucket.above.rescued_fn}
                     </span>
                   </div>
                   <div className="flex justify-between gap-4">
-                    <span className="text-yellow-400">
+                    <span className="text-yellow-600 dark:text-yellow-400">
                       Misclassified (Auto)
                     </span>
                     <span className="font-mono font-semibold">
@@ -1061,13 +1286,15 @@ export default function ReviewTrustOverview({
                   </div>
                   <div className="my-1 border-t border-border" />
                   <div className="flex justify-between gap-4">
-                    <span className="text-rose-400">FP (Human-Edited)</span>
+                    <span className="text-rose-500 dark:text-rose-400">
+                      FP (Human-Edited)
+                    </span>
                     <span className="font-mono font-semibold">
                       {hover.bucket.below.fp}
                     </span>
                   </div>
                   <div className="flex justify-between gap-4">
-                    <span className="text-yellow-400">
+                    <span className="text-yellow-600 dark:text-yellow-400">
                       Misclassified (Human)
                     </span>
                     <span className="font-mono font-semibold">
@@ -1078,19 +1305,23 @@ export default function ReviewTrustOverview({
               ) : (
                 <div className="space-y-0.5">
                   <div className="flex justify-between gap-4">
-                    <span className="text-slate-300">Detections (Auto)</span>
+                    <span className="text-muted-foreground">
+                      Detections (Auto)
+                    </span>
                     <span className="font-mono font-semibold">
                       {hover.bucket.above.detections}
                     </span>
                   </div>
                   <div className="flex justify-between gap-4">
-                    <span className="text-rose-300">Auto-Suppressed FP</span>
+                    <span className="text-rose-500 dark:text-rose-300">
+                      Auto-Suppressed FP
+                    </span>
                     <span className="font-mono font-semibold">
                       {hover.bucket.above.auto_suppressed_fp}
                     </span>
                   </div>
                   <div className="flex justify-between gap-4">
-                    <span className="text-yellow-400">
+                    <span className="text-yellow-600 dark:text-yellow-400">
                       Misclassified (Auto)
                     </span>
                     <span className="font-mono font-semibold">
@@ -1098,26 +1329,30 @@ export default function ReviewTrustOverview({
                     </span>
                   </div>
                   <div className="flex justify-between gap-4">
-                    <span className="text-slate-200">□ Background Clips</span>
+                    <span className="text-foreground">□ Background Clips</span>
                     <span className="font-mono font-semibold">
                       {hover.bucket.above.background_clips}
                     </span>
                   </div>
                   <div className="my-1 border-t border-border" />
                   <div className="flex justify-between gap-4">
-                    <span className="text-red-400">FN (Human-Edited)</span>
+                    <span className="text-red-500 dark:text-red-400">
+                      FN (Human-Edited)
+                    </span>
                     <span className="font-mono font-semibold">
                       {hover.bucket.below.fn}
                     </span>
                   </div>
                   <div className="flex justify-between gap-4">
-                    <span className="text-rose-400">FP (Human-Edited)</span>
+                    <span className="text-rose-500 dark:text-rose-400">
+                      FP (Human-Edited)
+                    </span>
                     <span className="font-mono font-semibold">
                       {hover.bucket.below.fp}
                     </span>
                   </div>
                   <div className="flex justify-between gap-4">
-                    <span className="text-yellow-400">
+                    <span className="text-yellow-600 dark:text-yellow-400">
                       Misclassified (Human)
                     </span>
                     <span className="font-mono font-semibold">
@@ -1133,18 +1368,21 @@ export default function ReviewTrustOverview({
               style={tooltipStyle}
             >
               <div className="mb-1 border-b border-border pb-1 font-semibold">
-                {formatBucketRange(hover.bucket)} · Alert Timing (
+                {formatBucketRange(hover.bucket)} ·{" "}
+                {isAlerts ? "Alert Timing" : "Detection Timing"} (
                 {hover.bucket.timing.count})
               </div>
               <div className="space-y-0.5">
                 <div className="flex justify-between gap-4">
-                  <span className="text-slate-300">Discovery</span>
+                  <span className="text-muted-foreground">Discovery</span>
                   <span className="font-mono">
                     {(hover.bucket.timing.avg_discovery_ms / 1000).toFixed(2)}s
                   </span>
                 </div>
                 <div className="flex justify-between gap-4">
-                  <span className="text-amber-400">Resource Busy</span>
+                  <span className="text-amber-600 dark:text-amber-400">
+                    Resource Busy
+                  </span>
                   <span className="font-mono">
                     {(hover.bucket.timing.avg_resource_busy_ms / 1000).toFixed(
                       2,
@@ -1152,30 +1390,44 @@ export default function ReviewTrustOverview({
                     s
                   </span>
                 </div>
-                <div className="flex justify-between gap-4">
-                  <span className="text-violet-400">Confirmation</span>
-                  <span className="font-mono">
-                    {(hover.bucket.timing.avg_confirmation_ms / 1000).toFixed(
-                      2,
-                    )}
-                    s
-                  </span>
-                </div>
+                {isAlerts && (
+                  <div className="flex justify-between gap-4">
+                    <span className="text-violet-600 dark:text-violet-400">
+                      Confirmation
+                    </span>
+                    <span className="font-mono">
+                      {(hover.bucket.timing.avg_confirmation_ms / 1000).toFixed(
+                        2,
+                      )}
+                      s
+                    </span>
+                  </div>
+                )}
                 <div className="my-1 border-t border-border" />
                 <div className="flex justify-between gap-4 font-semibold">
                   <span>Average Total</span>
                   <span className="font-mono">
-                    {(hover.bucket.timing.avg_total_ms / 1000).toFixed(2)}s
+                    {(
+                      ((hover.bucket.timing.avg_discovery_ms ?? 0) +
+                        (hover.bucket.timing.avg_resource_busy_ms ?? 0) +
+                        (isAlerts
+                          ? (hover.bucket.timing.avg_confirmation_ms ?? 0)
+                          : 0)) /
+                      1000
+                    ).toFixed(2)}
+                    s
                   </span>
                 </div>
-                <div className="flex justify-between gap-4 text-cyan-400">
-                  <span>Slowest Alert</span>
+                <div className="flex justify-between gap-4 text-cyan-600 dark:text-cyan-400">
+                  <span>
+                    {isAlerts ? "Slowest Alert" : "Slowest Detection"}
+                  </span>
                   <span className="font-mono">
                     {(hover.bucket.timing.slowest_ms / 1000).toFixed(2)}s
                   </span>
                 </div>
                 {hover.bucket.timing.slowest_review_id && (
-                  <div className="pt-0.5 text-[11px] text-cyan-300">
+                  <div className="pt-0.5 text-[11px] text-cyan-600 dark:text-cyan-300">
                     Click to open slowest review →
                   </div>
                 )}

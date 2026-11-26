@@ -326,27 +326,54 @@ class ReviewSegmentMaintainer(threading.Thread):
         segment: PendingReviewSegment,
         alert_time: float,
         alert_objects: list[dict[str, Any]],
+        severity: str = "alert",
     ) -> None:
-        """Record alert confirmation and detector queue latency into ReviewTrustStore.
+        """Record alert/detection latency breakdown into ReviewTrustStore.
 
         Note: ``discovery_ms`` is kept at ``0.0`` as an explicit placeholder for
-        future Reverse Norfair frame-discovery tracking.
+        future Reverse Norfair frame-discovery tracking. For ``detection``
+        segments, ``confirmation_ms`` is always ``0.0``.
         """
         store = getattr(self, "trust_store", None) or get_review_trust_store()
         if store is None:
             return
 
+        from frigate.review.trust_store import MAX_VALID_TIMING_MS
+
         confirmation_ms = 0.0
         resource_busy_ms = 0.0
         if alert_objects:
-            earliest_start = min(
-                float(o.get("start_time", alert_time)) for o in alert_objects
+            resource_busy_ms = min(
+                MAX_VALID_TIMING_MS,
+                max(
+                    float(o.get("accumulated_resource_busy_ms") or 0.0)
+                    for o in alert_objects
+                ),
             )
-            confirmation_ms = max(0.0, (float(alert_time) - earliest_start) * 1000.0)
-            resource_busy_ms = max(
-                float(o.get("accumulated_resource_busy_ms") or 0.0)
-                for o in alert_objects
-            )
+            if severity == "alert":
+                candidate_confirmations: list[float] = []
+                for o in alert_objects:
+                    start_t = float(o.get("start_time", alert_time))
+                    last_active_t = float(o.get("last_active_time") or start_t)
+                    ref_start = max(start_t, last_active_t)
+                    elapsed_ms = max(0.0, (float(alert_time) - ref_start) * 1000.0)
+                    if elapsed_ms <= MAX_VALID_TIMING_MS:
+                        candidate_confirmations.append(elapsed_ms)
+                        continue
+                    confirmed_t = o.get("confirmed_time")
+                    if confirmed_t is not None:
+                        conf_elapsed = max(
+                            0.0, (float(confirmed_t) - start_t) * 1000.0
+                        )
+                        if conf_elapsed <= MAX_VALID_TIMING_MS:
+                            candidate_confirmations.append(conf_elapsed)
+
+                if not candidate_confirmations:
+                    # All objects triggering this alert are long-lived tracks
+                    # (>30s old) with no fresh confirmation window; skip so
+                    # stationary/loitering track ages do not skew alert timing.
+                    return
+                confirmation_ms = min(candidate_confirmations)
 
         # Placeholder for future Reverse Norfair pre-birth discovery latency
         discovery_ms = 0.0
@@ -358,10 +385,12 @@ class ReviewSegmentMaintainer(threading.Thread):
                 discovery_ms=discovery_ms,
                 resource_busy_ms=resource_busy_ms,
                 confirmation_ms=confirmation_ms,
+                severity=severity,
             )
         except Exception:
             logger.debug(
-                "Failed to record alert timing for review %s",
+                "Failed to record %s timing for review %s",
+                severity,
                 segment.id,
                 exc_info=True,
             )
@@ -725,6 +754,14 @@ class ReviewSegmentMaintainer(threading.Thread):
                             new_segment,
                             frame_time,
                             activity.categorized_objects["alerts"],
+                            severity="alert",
+                        )
+                    elif severity == SeverityEnum.detection:
+                        self._record_alert_timing(
+                            new_segment,
+                            frame_time,
+                            activity.categorized_objects["detections"],
+                            severity="detection",
                         )
                 except FileNotFoundError:
                     return

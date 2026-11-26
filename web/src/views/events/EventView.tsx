@@ -103,7 +103,11 @@ import MotionPreviewsPane from "./MotionPreviewsPane";
 import CorrectionsView from "./CorrectionsView";
 import ReviewTrustOverview from "@/components/events/ReviewTrustOverview";
 import ReviewFeedbackBar from "@/components/events/ReviewFeedbackBar";
-import { GoldenClipSummary, ReviewFeedbackItem } from "@/types/reviewTrust";
+import {
+  GoldenClipSummary,
+  ReviewFeedbackItem,
+  TrustCategoryFilter,
+} from "@/types/reviewTrust";
 import { EmptyCard } from "@/components/card/EmptyCard";
 import { EmptyCardData } from "@/types/card";
 
@@ -599,6 +603,15 @@ export default function EventView({
             showReviewed={showReviewed}
             onOpenRecording={onOpenRecording}
             onUnreviewedFnCountChange={setUnreviewedFnCount}
+            onOpenCorrections={
+              config.secondlook?.save_and_review.enabled
+                ? (kind, outcome = "all") => {
+                    setCorrectionKind(kind);
+                    setCorrectionOutcome(outcome);
+                    setSeverityToggle("correction");
+                  }
+                : undefined
+            }
           />
         )}
         {severity == "significant_motion" && (
@@ -625,6 +638,19 @@ export default function EventView({
     </div>
   );
 }
+
+const TRUST_CATEGORY_LABELS: Record<TrustCategoryFilter, string> = {
+  alerts: "Alerts (Auto)",
+  detections: "Detections (Auto)",
+  rescued_fn: "Rescued FN (Auto)",
+  auto_suppressed_fp: "Auto-Suppressed FP",
+  auto_misclassified: "Misclassified (Auto)",
+  background_clips: "Background Clips",
+  fn: "FN (Human-Edited)",
+  fp: "FP (Human-Edited)",
+  human_misclassified: "Misclassified (Human-Edited)",
+  golden: "Golden Clips",
+};
 
 type DetectionReviewProps = {
   contentRef: MutableRefObject<HTMLDivElement | null>;
@@ -661,6 +687,10 @@ type DetectionReviewProps = {
   showReviewed: boolean;
   onOpenRecording: (recordingInfo: RecordingStartingPoint) => void;
   onUnreviewedFnCountChange: (count: number) => void;
+  onOpenCorrections?: (
+    kind: CorrectionKind,
+    outcome?: CorrectionOutcome,
+  ) => void;
 };
 function DetectionReview({
   contentRef,
@@ -685,11 +715,60 @@ function DetectionReview({
   showReviewed,
   onOpenRecording,
   onUnreviewedFnCountChange,
+  onOpenCorrections,
 }: DetectionReviewProps) {
   const { t } = useTranslation(["views/events"]);
   const [feedbackByReviewId, setFeedbackByReviewId] = useState<
     Record<string, ReviewFeedbackItem>
   >({});
+  const [activeTrustCategory, setActiveTrustCategory] =
+    useState<TrustCategoryFilter | null>(null);
+  const [goldenReviewIds, setGoldenReviewIds] = useState<Set<string>>(
+    () => new Set(),
+  );
+  const [openGoldenDialogSignal, setOpenGoldenDialogSignal] = useState(0);
+
+  useEffect(() => {
+    setActiveTrustCategory(null);
+  }, [severity]);
+
+  const displayedItems = useMemo(() => {
+    if (!currentItems || activeTrustCategory === null) {
+      return currentItems;
+    }
+    switch (activeTrustCategory) {
+      case "alerts":
+      case "detections":
+        return currentItems.filter((item) => {
+          const fb = feedbackByReviewId[item.id];
+          return !fb || fb.verdict === "good";
+        });
+      case "fp":
+        return currentItems.filter(
+          (item) => feedbackByReviewId[item.id]?.verdict === "fp",
+        );
+      case "fn":
+        return currentItems.filter(
+          (item) => feedbackByReviewId[item.id]?.verdict === "fn",
+        );
+      case "human_misclassified":
+        return currentItems.filter(
+          (item) => feedbackByReviewId[item.id]?.verdict === "misclassified",
+        );
+      case "golden":
+        return currentItems.filter((item) => goldenReviewIds.has(item.id));
+      case "rescued_fn":
+      case "auto_suppressed_fp":
+      case "auto_misclassified":
+      case "background_clips":
+        return [];
+    }
+  }, [
+    currentItems,
+    activeTrustCategory,
+    feedbackByReviewId,
+    goldenReviewIds,
+  ]);
 
   const reviewTimelineRef = useRef<HTMLDivElement>(null);
 
@@ -1002,12 +1081,94 @@ function DetectionReview({
             filter={filter}
             showReviewed={showReviewed}
             selectedTimeRange={selectedOverviewTimeRange}
+            activeCategory={activeTrustCategory}
+            openGoldenDialogSignal={openGoldenDialogSignal}
+            onSelectCategory={setActiveTrustCategory}
             onSelectTimeRange={handleSelectOverviewTimeRange}
             onOpenReviewId={handleOpenReviewId}
             onGoldenClipClick={handleGoldenClipClick}
+            onGoldenReviewIdsChange={setGoldenReviewIds}
             onFeedbackMapChange={setFeedbackByReviewId}
             onUnreviewedFnCountChange={onUnreviewedFnCountChange}
           />
+        )}
+
+        {activeTrustCategory !== null && (
+          <div className="mx-1 mb-2 flex w-full flex-wrap items-center justify-between gap-2 rounded-lg border border-primary/40 bg-primary/10 px-3 py-2 text-xs md:mx-2">
+            <div className="flex flex-wrap items-center gap-2">
+              <span className="font-semibold text-foreground">
+                Filtered by: {TRUST_CATEGORY_LABELS[activeTrustCategory]}
+              </span>
+              {activeTrustCategory === "auto_suppressed_fp" ||
+              activeTrustCategory === "rescued_fn" ||
+              activeTrustCategory === "auto_misclassified" ? (
+                <span className="text-muted-foreground">
+                  Secondlook automatic items are stored in the Corrections tab.
+                </span>
+              ) : activeTrustCategory === "background_clips" ? (
+                <span className="text-muted-foreground">
+                  Background clips are stored in Golden Clips.
+                </span>
+              ) : (
+                <span className="text-muted-foreground">
+                  Showing {displayedItems?.length ?? 0} of{" "}
+                  {currentItems?.length ?? 0} loaded items
+                </span>
+              )}
+            </div>
+            <div className="flex items-center gap-2">
+              {onOpenCorrections &&
+                activeTrustCategory === "auto_suppressed_fp" && (
+                  <Button
+                    size="sm"
+                    variant="secondary"
+                    className="h-7 px-2.5 text-xs"
+                    onClick={() => onOpenCorrections("false_positive", "acted")}
+                  >
+                    Open in Corrections →
+                  </Button>
+                )}
+              {onOpenCorrections && activeTrustCategory === "rescued_fn" && (
+                <Button
+                  size="sm"
+                  variant="secondary"
+                  className="h-7 px-2.5 text-xs"
+                  onClick={() => onOpenCorrections("false_negative", "acted")}
+                >
+                  Open in Corrections →
+                </Button>
+              )}
+              {onOpenCorrections &&
+                activeTrustCategory === "auto_misclassified" && (
+                  <Button
+                    size="sm"
+                    variant="secondary"
+                    className="h-7 px-2.5 text-xs"
+                    onClick={() => onOpenCorrections("misclass", "all")}
+                  >
+                    Open in Corrections →
+                  </Button>
+                )}
+              {activeTrustCategory === "background_clips" && (
+                <Button
+                  size="sm"
+                  variant="secondary"
+                  className="h-7 px-2.5 text-xs"
+                  onClick={() => setOpenGoldenDialogSignal((n) => n + 1)}
+                >
+                  Open Golden Clips →
+                </Button>
+              )}
+              <Button
+                size="sm"
+                variant="outline"
+                className="h-7 px-2.5 text-xs"
+                onClick={() => setActiveTrustCategory(null)}
+              >
+                Clear filter ×
+              </Button>
+            </div>
+          </div>
         )}
 
         {!currentItems && (
@@ -1016,24 +1177,42 @@ function DetectionReview({
           </div>
         )}
 
-        {!loading && currentItems?.length === 0 && (
-          <div className="mx-auto py-8">
-            <EmptyCard
-              className="items-center text-center"
-              title={emptyCardData.title}
-              titleHeading={false}
-              description={emptyCardData.description}
-              icon={<LuFolderCheck className="size-16" />}
-            />
-          </div>
-        )}
+        {!loading &&
+          displayedItems?.length === 0 &&
+          activeTrustCategory === null && (
+            <div className="mx-auto py-8">
+              <EmptyCard
+                className="items-center text-center"
+                title={emptyCardData.title}
+                titleHeading={false}
+                description={emptyCardData.description}
+                icon={<LuFolderCheck className="size-16" />}
+              />
+            </div>
+          )}
+
+        {!loading &&
+          displayedItems?.length === 0 &&
+          activeTrustCategory !== null &&
+          activeTrustCategory !== "auto_suppressed_fp" &&
+          activeTrustCategory !== "rescued_fn" &&
+          activeTrustCategory !== "auto_misclassified" &&
+          activeTrustCategory !== "background_clips" && (
+            <div className="mx-auto py-8 text-center text-sm text-muted-foreground">
+              No items in this view match{" "}
+              <span className="font-medium text-foreground">
+                {TRUST_CATEGORY_LABELS[activeTrustCategory]}
+              </span>
+              .
+            </div>
+          )}
 
         <div
           className="grid w-full gap-2 px-1 sm:grid-cols-2 md:mx-2 md:grid-cols-3 md:gap-4 3xl:grid-cols-4"
           ref={contentRef}
         >
-          {!loading && currentItems
-            ? currentItems.map((value) => {
+          {!loading && displayedItems
+            ? displayedItems.map((value) => {
                 const selected = selectedReviews.some((r) => r.id === value.id);
 
                 return (
@@ -1086,7 +1265,7 @@ function DetectionReview({
                   <Skeleton key={idx} className="aspect-video size-full" />
                 ))}
           {!loading &&
-            (currentItems?.filter((seg) => seg.end_time)?.length ?? 0) > 0 &&
+            (displayedItems?.filter((seg) => seg.end_time)?.length ?? 0) > 0 &&
             (itemsToReview ?? 0) > 0 && (
               <div className="col-span-full flex items-center justify-center">
                 <Button
@@ -1095,7 +1274,7 @@ function DetectionReview({
                   variant="select"
                   onClick={() => {
                     setSelectedReviews([]);
-                    markItemsAsReviewed(currentItems ?? []);
+                    markItemsAsReviewed(displayedItems ?? []);
                   }}
                 >
                   {t("markTheseItemsAsReviewed")}

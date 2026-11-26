@@ -132,6 +132,8 @@ class TrackedObject:
         self.accumulated_resource_busy_ms: float = float(
             obj_data.get("frame_resource_busy_ms") or 0.0
         )
+        self.last_active_time: float = float(obj_data.get("start_time") or 0.0)
+        self.confirmed_time: float | None = None
         self.previous = self.to_dict()
 
     @property
@@ -455,8 +457,8 @@ class TrackedObject:
         if len(self.score_history) > 10:
             self.score_history = self.score_history[-10:]
 
-        # Accumulate detector queue wait during object birth/confirmation
-        if obj_data.get("frame_resource_busy_ms") is not None:
+        # Accumulate detector queue wait during object birth/confirmation only
+        if self.false_positive and obj_data.get("frame_resource_busy_ms") is not None:
             self.accumulated_resource_busy_ms += float(
                 obj_data["frame_resource_busy_ms"]
             )
@@ -492,6 +494,8 @@ class TrackedObject:
         if not was_primary and self.primary_would_release:
             self.primary_crossing_median = raw_median
         self.false_positive = self._is_false_positive()
+        if was_false_positive and not self.false_positive and self.confirmed_time is None:
+            self.confirmed_time = float(current_frame_time)
         if (
             self.camera_config.secondlook._save_and_review_enabled
             and self._secondlook_enabled_for_label()
@@ -507,7 +511,10 @@ class TrackedObject:
         self._remember_correction(
             raw_median, threshold, was_false_positive, current_frame_time
         )
+        was_active = self.active
         self.active = self.is_active()
+        if not was_active and self.active:
+            self.last_active_time = float(current_frame_time)
 
         if not self.false_positive and has_valid_frame:
             # determine if this frame is a better thumbnail
@@ -791,6 +798,8 @@ class TrackedObject:
             "path_data": self.path_data.copy(),
             "recognized_license_plate": self.obj_data.get("recognized_license_plate"),
             "accumulated_resource_busy_ms": self.accumulated_resource_busy_ms,
+            "last_active_time": self.last_active_time,
+            "confirmed_time": self.confirmed_time,
         }
 
         # Add any other obj_data keys (e.g. custom attribute fields) not yet included

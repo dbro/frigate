@@ -2,6 +2,18 @@ export type ReviewOverviewBarSize = "1m" | "10m" | "1h" | "4h" | "24h";
 
 export type ReviewOverviewSeverity = "alert" | "detection";
 
+export type TrustCategoryFilter =
+  | "alerts"
+  | "detections"
+  | "rescued_fn"
+  | "auto_suppressed_fp"
+  | "auto_misclassified"
+  | "background_clips"
+  | "fn"
+  | "fp"
+  | "human_misclassified"
+  | "golden";
+
 export type ReviewFeedbackVerdict =
   | "good"
   | "fp"

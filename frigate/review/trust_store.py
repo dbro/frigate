@@ -21,6 +21,10 @@ logger = logging.getLogger(__name__)
 VALID_VERDICTS = ("good", "fp", "fn", "misclassified")
 VALID_GOLDEN_KINDS = ("tp", "fp", "fn", "misclassified", "background")
 COVERAGE_CONDITIONS = ("day", "night_ir", "rain", "wind", "snow")
+# Upper bound for plausible live alert/detection timing samples (30 seconds).
+# Samples above this reflect stale stationary or loitering track ages rather
+# than live confirmation or detector queue latency.
+MAX_VALID_TIMING_MS = 30_000.0
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS review_feedback (
@@ -59,6 +63,7 @@ CREATE INDEX IF NOT EXISTS idx_golden_kind ON golden_clips(kind);
 CREATE TABLE IF NOT EXISTS alert_timings (
     review_id TEXT PRIMARY KEY,
     camera TEXT NOT NULL,
+    severity TEXT NOT NULL DEFAULT 'alert',
     alert_time REAL NOT NULL,
     discovery_ms REAL NOT NULL DEFAULT 0.0,
     resource_busy_ms REAL NOT NULL DEFAULT 0.0,
@@ -115,9 +120,12 @@ def _golden_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
 
 
 def _timing_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
+    keys = row.keys()
+    severity = row["severity"] if "severity" in keys else "alert"
     return {
         "review_id": row["review_id"],
         "camera": row["camera"],
+        "severity": severity,
         "alert_time": float(row["alert_time"]),
         "discovery_ms": float(row["discovery_ms"]),
         "resource_busy_ms": float(row["resource_busy_ms"]),
@@ -138,6 +146,15 @@ class ReviewTrustStore:
         os.makedirs(self.golden_clips_dir, exist_ok=True)
         with self._lock, self._connect() as conn:
             conn.executescript(_SCHEMA)
+            cols = {
+                row["name"]
+                for row in conn.execute("PRAGMA table_info(alert_timings)").fetchall()
+            }
+            if "severity" not in cols:
+                conn.execute(
+                    "ALTER TABLE alert_timings ADD COLUMN severity TEXT NOT NULL DEFAULT 'alert'"
+                )
+                conn.commit()
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.db_path, check_same_thread=False)
@@ -269,7 +286,7 @@ class ReviewTrustStore:
             row = conn.execute(sql, params).fetchone()
         return int(row[0]) if row else 0
 
-    # ---- Alert Timings ------------------------------------------------------
+    # ---- Alert & Detection Timings -----------------------------------------
 
     def record_alert_timing(
         self,
@@ -280,23 +297,28 @@ class ReviewTrustStore:
         resource_busy_ms: float = 0.0,
         confirmation_ms: float = 0.0,
         total_ms: float | None = None,
+        severity: str = "alert",
     ) -> dict[str, Any]:
-        """Record latency breakdown for a newly created alert review segment."""
+        """Record latency breakdown for a newly created alert or detection segment."""
+        sev = "detection" if severity == "detection" else "alert"
         disc = max(0.0, float(discovery_ms))
         busy = max(0.0, float(resource_busy_ms))
-        conf = max(0.0, float(confirmation_ms))
+        conf = 0.0 if sev == "detection" else max(0.0, float(confirmation_ms))
         total = (
             max(0.0, float(total_ms)) if total_ms is not None else disc + busy + conf
         )
+        if sev == "detection":
+            total = disc + busy
         with self._lock, self._connect() as conn:
             conn.execute(
                 """
                     INSERT INTO alert_timings (
-                        review_id, camera, alert_time, discovery_ms,
+                        review_id, camera, severity, alert_time, discovery_ms,
                         resource_busy_ms, confirmation_ms, total_ms
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(review_id) DO UPDATE SET
                         camera = excluded.camera,
+                        severity = excluded.severity,
                         alert_time = excluded.alert_time,
                         discovery_ms = excluded.discovery_ms,
                         resource_busy_ms = excluded.resource_busy_ms,
@@ -306,6 +328,7 @@ class ReviewTrustStore:
                 (
                     review_id,
                     camera,
+                    sev,
                     float(alert_time),
                     disc,
                     busy,
@@ -326,8 +349,9 @@ class ReviewTrustStore:
         start_time: float,
         end_time: float,
         cameras: list[str] | None = None,
+        severity: str | None = None,
     ) -> list[dict[str, Any]]:
-        """Return alert timing rows within [start_time, end_time]."""
+        """Return timing rows within [start_time, end_time], optionally filtered by severity."""
         clauses = ["alert_time >= ?", "alert_time <= ?"]
         params: list[Any] = [float(start_time), float(end_time)]
         if cameras is not None:
@@ -335,6 +359,9 @@ class ReviewTrustStore:
                 return []
             clauses.append(f"camera IN ({','.join('?' * len(cameras))})")
             params.extend(cameras)
+        if severity is not None:
+            clauses.append("severity = ?")
+            params.append(severity)
 
         sql = (
             f"SELECT * FROM alert_timings WHERE {' AND '.join(clauses)} "
