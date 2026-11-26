@@ -408,6 +408,8 @@ class RemoteObjectDetector:
             (20, 6), dtype=np.float32, buffer=self.out_shm.buf
         )
         self.detector_subscriber = ObjectDetectorSubscriber(name)
+        self.last_queue_wait_ms: float = 0.0
+        self.last_detect_ms: float = 0.0
 
     def detect(self, tensor_input: np.ndarray, threshold: float = 0.4) -> list:
         detections: list = []
@@ -426,8 +428,12 @@ class RemoteObjectDetector:
 
         # copy input to shared memory
         self.np_shm[:] = tensor_input[:]
+        wait_start = time.monotonic()
         self.detection_queue.put(self.name)
         result = self.detector_subscriber.check_for_update()
+        elapsed_ms = (time.monotonic() - wait_start) * 1000.0
+        self.last_queue_wait_ms = elapsed_ms
+        self.last_detect_ms = elapsed_ms
 
         # if it timed out
         if result is None:

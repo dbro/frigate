@@ -129,6 +129,9 @@ class TrackedObject:
         self.average_estimated_speed: float = 0
         self.velocity_angle = 0
         self.path_data: list[tuple[Any, float]] = []
+        self.accumulated_resource_busy_ms: float = float(
+            obj_data.get("frame_resource_busy_ms") or 0.0
+        )
         self.previous = self.to_dict()
 
     @property
@@ -451,6 +454,12 @@ class TrackedObject:
         # only keep the last 10 scores
         if len(self.score_history) > 10:
             self.score_history = self.score_history[-10:]
+
+        # Accumulate detector queue wait during object birth/confirmation
+        if obj_data.get("frame_resource_busy_ms") is not None:
+            self.accumulated_resource_busy_ms += float(
+                obj_data["frame_resource_busy_ms"]
+            )
 
         # Max-primary frame for Corrections fine-tune still (track end deposit)
         if (
@@ -781,6 +790,7 @@ class TrackedObject:
             "velocity_angle": self.velocity_angle,
             "path_data": self.path_data.copy(),
             "recognized_license_plate": self.obj_data.get("recognized_license_plate"),
+            "accumulated_resource_busy_ms": self.accumulated_resource_busy_ms,
         }
 
         # Add any other obj_data keys (e.g. custom attribute fields) not yet included

@@ -29,6 +29,7 @@ from frigate.api import (
     review,
     save_and_review,
     secondlook_debug,
+    trust,
 )
 from frigate.api.auth import get_jwt_secret, limiter, require_admin_by_default
 from frigate.comms.dispatcher import Dispatcher
@@ -39,10 +40,18 @@ from frigate.config import FrigateConfig
 from frigate.config.camera.updater import CameraConfigUpdatePublisher
 from frigate.config.holder import ConfigHolder
 from frigate.config.profile_manager import ProfileManager
+from frigate.const import EXPORT_DIR
 from frigate.debug_replay import DebugReplayManager, debug_replay_auto_stop_watchdog
 from frigate.embeddings import EmbeddingsContext
 from frigate.genai import GenAIClientManager
 from frigate.ptz.onvif import OnvifController
+from frigate.review.trust_store import (
+    ReviewTrustStore,
+    default_trust_db_path,
+    get_review_trust_store,
+    init_review_trust_store,
+)
+from frigate.secondlook.save_and_review import get_save_and_review_store
 from frigate.stats.emitter import StatsEmitter
 from frigate.storage import StorageMaintainer
 
@@ -78,6 +87,7 @@ def create_fastapi_app(
     profile_manager: ProfileManager | None = None,
     enforce_default_admin: bool = True,
     config_holder: ConfigHolder | None = None,
+    review_trust_store: ReviewTrustStore | None = None,
 ):
     logger.info("Starting FastAPI app")
     app = FastAPI(
@@ -142,6 +152,7 @@ def create_fastapi_app(
     app.include_router(camera.router)
     app.include_router(chat.router)
     app.include_router(classification.router)
+    app.include_router(trust.router)
     app.include_router(review.router)
     app.include_router(save_and_review.router)
     app.include_router(secondlook_debug.router)
@@ -171,6 +182,18 @@ def create_fastapi_app(
     app.dispatcher = dispatcher
     app.profile_manager = profile_manager
     app.config_holder = config_holder
+    if review_trust_store is not None:
+        app.review_trust_store = review_trust_store
+    else:
+        existing_trust_store = get_review_trust_store()
+        if existing_trust_store is not None:
+            app.review_trust_store = existing_trust_store
+        else:
+            app.review_trust_store = init_review_trust_store(
+                default_trust_db_path(frigate_config.database.path),
+                EXPORT_DIR,
+            )
+    app.secondlook_store = get_save_and_review_store()
 
     if frigate_config.auth.enabled:
         secret = get_jwt_secret()

@@ -101,6 +101,9 @@ import ReviewActivityCalendar from "@/components/overlay/ReviewActivityCalendar"
 import PlatformAwareDialog from "@/components/overlay/dialog/PlatformAwareDialog";
 import MotionPreviewsPane from "./MotionPreviewsPane";
 import CorrectionsView from "./CorrectionsView";
+import ReviewTrustOverview from "@/components/events/ReviewTrustOverview";
+import ReviewFeedbackBar from "@/components/events/ReviewFeedbackBar";
+import { GoldenClipSummary, ReviewFeedbackItem } from "@/types/reviewTrust";
 import { EmptyCard } from "@/components/card/EmptyCard";
 import { EmptyCardData } from "@/types/card";
 
@@ -166,6 +169,7 @@ export default function EventView({
     {refreshInterval: 10000},
   );
   const correctionCount = correctionCounts ? (showReviewed ? correctionCounts.total : correctionCounts.unreviewed) : -1;
+  const [unreviewedFnCount, setUnreviewedFnCount] = useState<number>(0);
 
   // review counts
 
@@ -462,6 +466,11 @@ export default function EventView({
                   ) : (
                     <ActivityIndicator className="ml-2 size-4" />
                   )}
+                  {unreviewedFnCount > 0 && (
+                    <span className="ml-1.5 rounded-full bg-red-600 px-1.5 py-0.5 text-[11px] font-semibold leading-none text-white">
+                      {unreviewedFnCount} FN
+                    </span>
+                  )}
                 </div>
               </div>
             </ToggleGroupItem>
@@ -586,6 +595,10 @@ export default function EventView({
             onSelectAllReviews={onSelectAllReviews}
             setSelectedReviews={setSelectedReviews}
             pullLatestData={pullLatestData}
+            updateFilter={updateFilter}
+            showReviewed={showReviewed}
+            onOpenRecording={onOpenRecording}
+            onUnreviewedFnCountChange={setUnreviewedFnCount}
           />
         )}
         {severity == "significant_motion" && (
@@ -644,6 +657,10 @@ type DetectionReviewProps = {
   onSelectAllReviews: () => void;
   setSelectedReviews: (reviews: ReviewSegment[]) => void;
   pullLatestData: () => void;
+  updateFilter: (filter: ReviewFilter) => void;
+  showReviewed: boolean;
+  onOpenRecording: (recordingInfo: RecordingStartingPoint) => void;
+  onUnreviewedFnCountChange: (count: number) => void;
 };
 function DetectionReview({
   contentRef,
@@ -664,10 +681,84 @@ function DetectionReview({
   onSelectAllReviews,
   setSelectedReviews,
   pullLatestData,
+  updateFilter,
+  showReviewed,
+  onOpenRecording,
+  onUnreviewedFnCountChange,
 }: DetectionReviewProps) {
   const { t } = useTranslation(["views/events"]);
+  const [feedbackByReviewId, setFeedbackByReviewId] = useState<
+    Record<string, ReviewFeedbackItem>
+  >({});
 
   const reviewTimelineRef = useRef<HTMLDivElement>(null);
+
+  const selectedOverviewTimeRange = useMemo(
+    () =>
+      filter?.after != null && filter?.before != null
+        ? { start: filter.after, end: filter.before }
+        : null,
+    [filter?.after, filter?.before],
+  );
+
+  const handleSelectOverviewTimeRange = useCallback(
+    (start: number, end: number) => {
+      const isSameRange = filter?.after === start && filter?.before === end;
+      updateFilter({
+        ...filter,
+        after: isSameRange ? undefined : start,
+        before: isSameRange ? undefined : end,
+      });
+    },
+    [filter, updateFilter],
+  );
+
+  const handleOpenReviewId = useCallback(
+    (reviewId: string) => {
+      const localMatch = reviewItems?.all?.find((seg) => seg.id === reviewId);
+      if (localMatch) {
+        onOpenRecording({
+          camera: localMatch.camera,
+          startTime: localMatch.start_time - REVIEW_PADDING,
+          severity: localMatch.severity,
+        });
+        return;
+      }
+
+      axios
+        .get(`review/${encodeURIComponent(reviewId)}`)
+        .then((resp) => {
+          if (resp.data) {
+            onOpenRecording({
+              camera: resp.data.camera,
+              startTime: resp.data.start_time - REVIEW_PADDING,
+              severity: resp.data.severity,
+            });
+          }
+        })
+        .catch(() => {
+          toast.error("Unable to open review item", { position: "top-center" });
+        });
+    },
+    [onOpenRecording, reviewItems?.all],
+  );
+
+  const handleGoldenClipClick = useCallback(
+    (clip: GoldenClipSummary) => {
+      if (clip.review_id) {
+        handleOpenReviewId(clip.review_id);
+        return;
+      }
+      if (clip.start_time != null) {
+        onOpenRecording({
+          camera: clip.camera,
+          startTime: clip.start_time - REVIEW_PADDING,
+          severity: severity === "detection" ? "detection" : "alert",
+        });
+      }
+    },
+    [handleOpenReviewId, onOpenRecording, severity],
+  );
 
   // preview
 
@@ -905,20 +996,36 @@ function DetectionReview({
           />
         )}
 
+        {(severity === "alert" || severity === "detection") && (
+          <ReviewTrustOverview
+            severity={severity}
+            filter={filter}
+            showReviewed={showReviewed}
+            selectedTimeRange={selectedOverviewTimeRange}
+            onSelectTimeRange={handleSelectOverviewTimeRange}
+            onOpenReviewId={handleOpenReviewId}
+            onGoldenClipClick={handleGoldenClipClick}
+            onFeedbackMapChange={setFeedbackByReviewId}
+            onUnreviewedFnCountChange={onUnreviewedFnCountChange}
+          />
+        )}
+
         {!currentItems && (
-          <div className="absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2">
+          <div className="mx-auto py-12">
             <ActivityIndicator />
           </div>
         )}
 
         {!loading && currentItems?.length === 0 && (
-          <EmptyCard
-            className="absolute left-[50%] top-[50%] -translate-x-1/2 -translate-y-1/2 items-center text-center"
-            title={emptyCardData.title}
-            titleHeading={false}
-            description={emptyCardData.description}
-            icon={<LuFolderCheck className="size-16" />}
-          />
+          <div className="mx-auto py-8">
+            <EmptyCard
+              className="items-center text-center"
+              title={emptyCardData.title}
+              titleHeading={false}
+              description={emptyCardData.description}
+              icon={<LuFolderCheck className="size-16" />}
+            />
+          </div>
         )}
 
         <div
@@ -938,9 +1045,9 @@ function DetectionReview({
                       alignStartDateToTimeline(value.start_time) -
                       zoomSettings.segmentDuration
                     }
-                    className="review-item relative rounded-lg"
+                    className="review-item relative flex flex-col overflow-hidden rounded-lg border border-border/60 bg-card"
                   >
-                    <div className="aspect-video overflow-hidden rounded-lg">
+                    <div className="aspect-video overflow-hidden">
                       <PreviewThumbnailPlayer
                         review={value}
                         allPreviews={relevantPreviews}
@@ -957,6 +1064,10 @@ function DetectionReview({
                         }}
                       />
                     </div>
+                    <ReviewFeedbackBar
+                      review={value}
+                      feedback={feedbackByReviewId[value.id]}
+                    />
                     <div
                       className={cn(
                         "review-item-ring pointer-events-none absolute inset-0 z-10 size-full rounded-lg outline outline-[3px] -outline-offset-[2.8px]",

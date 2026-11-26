@@ -76,6 +76,11 @@ from frigate.record.cleanup import RecordingCleanup
 from frigate.record.export import migrate_exports
 from frigate.record.record import RecordProcess
 from frigate.review.review import ReviewProcess
+from frigate.review.trust_store import (
+    ReviewTrustStore,
+    default_trust_db_path,
+    init_review_trust_store,
+)
 from frigate.secondlook.retention import start_retention
 from frigate.secondlook.save_and_review import configure_save_and_review
 from frigate.stats.emitter import StatsEmitter
@@ -113,6 +118,7 @@ class FrigateApp:
         self.processes: dict[str, int] = {}
         self.embeddings: EmbeddingsContext | None = None
         self.config_holder = ConfigHolder(config)
+        self.review_trust_store: ReviewTrustStore | None = None
 
     @property
     def config(self) -> FrigateConfig:
@@ -246,6 +252,15 @@ class FrigateApp:
             )
         except Exception:
             logger.exception("Failed to init Secondlook save-and-review store")
+
+    def init_review_trust_store(self) -> None:
+        """Open the separate Review Trust Overview SQLite store."""
+        try:
+            db_path = default_trust_db_path(self.config.database.path)
+            self.review_trust_store = init_review_trust_store(db_path, EXPORT_DIR)
+            logger.info("Review trust store ready db=%s", db_path)
+        except Exception:
+            logger.exception("Failed to init Review trust store")
 
 
     def init_go2rtc(self) -> None:
@@ -595,6 +610,7 @@ class FrigateApp:
         self.init_queues()
         self.init_database()
         self.init_secondlook_save_and_review()
+        self.init_review_trust_store()
         self.init_onvif()
         self.init_recording_manager()
         self.init_review_segment_manager()
@@ -659,6 +675,7 @@ class FrigateApp:
                     self.dispatcher,
                     self.profile_manager,
                     config_holder=self.config_holder,
+                    review_trust_store=self.review_trust_store,
                 ),
                 host="127.0.0.1",
                 port=5001,

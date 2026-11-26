@@ -27,9 +27,16 @@ from frigate.config.camera.updater import (
 from frigate.const import (
     CLEAR_ONGOING_REVIEW_SEGMENTS,
     CLIPS_DIR,
+    EXPORT_DIR,
     UPSERT_REVIEW_SEGMENT,
 )
 from frigate.models import ReviewSegment
+from frigate.review.trust_store import (
+    ReviewTrustStore,
+    default_trust_db_path,
+    get_review_trust_store,
+    init_review_trust_store,
+)
 from frigate.review.types import SeverityEnum
 from frigate.track.object_processing import ManualEventState
 from frigate.util.image import SharedMemoryFrameManager, calculate_16_9_crop
@@ -296,10 +303,68 @@ class ReviewSegmentMaintainer(threading.Thread):
         # ensure dirs
         Path(os.path.join(CLIPS_DIR, "review")).mkdir(exist_ok=True)
 
+        self.trust_store: ReviewTrustStore | None = self._init_trust_store()
+
         self.stop_event = stop_event
 
         # clear ongoing review segments from last instance
         self.requestor.send_data(CLEAR_ONGOING_REVIEW_SEGMENTS, "")
+
+    def _init_trust_store(self) -> ReviewTrustStore | None:
+        existing = get_review_trust_store()
+        if existing is not None:
+            return existing
+        try:
+            db_path = default_trust_db_path(self.config.database.path)
+            return init_review_trust_store(db_path, EXPORT_DIR)
+        except Exception:
+            logger.debug("Failed to initialize ReviewTrustStore in maintainer", exc_info=True)
+            return None
+
+    def _record_alert_timing(
+        self,
+        segment: PendingReviewSegment,
+        alert_time: float,
+        alert_objects: list[dict[str, Any]],
+    ) -> None:
+        """Record alert confirmation and detector queue latency into ReviewTrustStore.
+
+        Note: ``discovery_ms`` is kept at ``0.0`` as an explicit placeholder for
+        future Reverse Norfair frame-discovery tracking.
+        """
+        store = getattr(self, "trust_store", None) or get_review_trust_store()
+        if store is None:
+            return
+
+        confirmation_ms = 0.0
+        resource_busy_ms = 0.0
+        if alert_objects:
+            earliest_start = min(
+                float(o.get("start_time", alert_time)) for o in alert_objects
+            )
+            confirmation_ms = max(0.0, (float(alert_time) - earliest_start) * 1000.0)
+            resource_busy_ms = max(
+                float(o.get("accumulated_resource_busy_ms") or 0.0)
+                for o in alert_objects
+            )
+
+        # Placeholder for future Reverse Norfair pre-birth discovery latency
+        discovery_ms = 0.0
+        try:
+            store.record_alert_timing(
+                review_id=segment.id,
+                camera=segment.camera,
+                alert_time=float(alert_time),
+                discovery_ms=discovery_ms,
+                resource_busy_ms=resource_busy_ms,
+                confirmation_ms=confirmation_ms,
+            )
+        except Exception:
+            logger.debug(
+                "Failed to record alert timing for review %s",
+                segment.id,
+                exc_info=True,
+            )
 
     def _publish_segment_start(
         self,
@@ -452,6 +517,11 @@ class ReviewSegmentMaintainer(threading.Thread):
                     segment.severity = SeverityEnum.alert
                     should_update_state = True
                     should_update_image = True
+                    self._record_alert_timing(
+                        segment,
+                        frame_time,
+                        activity.categorized_objects["alerts"],
+                    )
 
             if activity.has_activity_category(SeverityEnum.detection):
                 if (
@@ -650,6 +720,12 @@ class ReviewSegmentMaintainer(threading.Thread):
                     )
                     self.frame_manager.close(frame_name)
                     self._publish_segment_start(new_segment)
+                    if severity == SeverityEnum.alert:
+                        self._record_alert_timing(
+                            new_segment,
+                            frame_time,
+                            activity.categorized_objects["alerts"],
+                        )
                 except FileNotFoundError:
                     return
 

@@ -405,6 +405,7 @@ def process_frames(
                 if obj["id"] in stationary_object_ids
             ]
 
+            frame_resource_busy_ms = 0.0
             for region in regions:
                 detections.extend(
                     detect(
@@ -416,6 +417,9 @@ def process_frames(
                         camera_config.objects.track,
                         camera_config.objects.filters,
                     )
+                )
+                frame_resource_busy_ms += float(
+                    getattr(object_detector, "last_queue_wait_ms", 0.0) or 0.0
                 )
 
             consolidated_detections = reduce_detections(frame_shape, detections)
@@ -436,7 +440,13 @@ def process_frames(
         # build detections
         detections = {}
         for obj in object_tracker.tracked_objects.values():
-            detections[obj["id"]] = {**obj, "attributes": []}
+            detections[obj["id"]] = {
+                **obj,
+                "attributes": [],
+                "frame_resource_busy_ms": frame_resource_busy_ms
+                if camera_config.detect.enabled
+                else 0.0,
+            }
 
         # assign each detected attribute to the best matching object.
         # iterate consolidated_detections once so attributes that appear under

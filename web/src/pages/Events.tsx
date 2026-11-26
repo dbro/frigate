@@ -359,6 +359,9 @@ export default function Events() {
       cameras: reviewCamerasParam,
       labels: reviewSearchParams["labels"],
       zones: reviewSearchParams["zones"],
+      sub_labels: reviewSearchParams["sub_labels"],
+      min_score: reviewSearchParams["min_score"],
+      max_score: reviewSearchParams["max_score"],
       reviewed: null, // We want both reviewed and unreviewed items as we filter in the UI
       before: reviewSearchParams["before"] || last24Hours.before,
       after: reviewSearchParams["after"] || last24Hours.after,
@@ -455,6 +458,14 @@ export default function Events() {
 
     if (!current || current.length == 0) {
       return [];
+    }
+
+    if (reviewFilter?.sub_labels?.length) {
+      current = current.filter((seg) =>
+        seg.data.sub_labels?.some((sl) =>
+          reviewFilter.sub_labels?.includes(sl),
+        ),
+      );
     }
 
     if (!showReviewed) {

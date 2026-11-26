@@ -41,6 +41,9 @@ export type ReviewFilter = {
   cameras?: string[];
   labels?: string[];
   zones?: string[];
+  sub_labels?: string[];
+  min_score?: number;
+  max_score?: number;
   before?: number;
   after?: number;
   showAll?: boolean;

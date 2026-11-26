@@ -1,0 +1,544 @@
+"""SQLite store for Review Trust Overview, Human Feedback, Golden Clips, and Alert Timing.
+
+Stored in a separate SQLite database (``review_trust.db`` beside Frigate's DB)
+so Frigate's stock ``frigate.db`` schema remains untouched.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+import shutil
+import sqlite3
+import threading
+import time
+import uuid
+from typing import Any
+
+logger = logging.getLogger(__name__)
+
+VALID_VERDICTS = ("good", "fp", "fn", "misclassified")
+VALID_GOLDEN_KINDS = ("tp", "fp", "fn", "misclassified", "background")
+COVERAGE_CONDITIONS = ("day", "night_ir", "rain", "wind", "snow")
+
+_SCHEMA = """
+CREATE TABLE IF NOT EXISTS review_feedback (
+    review_id TEXT PRIMARY KEY,
+    camera TEXT NOT NULL,
+    severity TEXT NOT NULL,
+    verdict TEXT NOT NULL,
+    corrected_label TEXT,
+    reason TEXT,
+    start_time REAL NOT NULL,
+    updated_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_feedback_time ON review_feedback(start_time);
+CREATE INDEX IF NOT EXISTS idx_feedback_camera_time ON review_feedback(camera, start_time);
+
+CREATE TABLE IF NOT EXISTS golden_clips (
+    id TEXT PRIMARY KEY,
+    review_id TEXT,
+    camera TEXT NOT NULL,
+    severity TEXT NOT NULL,
+    start_time REAL NOT NULL,
+    end_time REAL,
+    kind TEXT NOT NULL,
+    object_label TEXT,
+    condition_tags TEXT,
+    export_id TEXT,
+    video_path TEXT,
+    sidecar_path TEXT NOT NULL,
+    notes TEXT,
+    created_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_golden_time ON golden_clips(start_time);
+CREATE INDEX IF NOT EXISTS idx_golden_camera_time ON golden_clips(camera, start_time);
+CREATE INDEX IF NOT EXISTS idx_golden_kind ON golden_clips(kind);
+
+CREATE TABLE IF NOT EXISTS alert_timings (
+    review_id TEXT PRIMARY KEY,
+    camera TEXT NOT NULL,
+    alert_time REAL NOT NULL,
+    discovery_ms REAL NOT NULL DEFAULT 0.0,
+    resource_busy_ms REAL NOT NULL DEFAULT 0.0,
+    confirmation_ms REAL NOT NULL DEFAULT 0.0,
+    total_ms REAL NOT NULL DEFAULT 0.0
+);
+CREATE INDEX IF NOT EXISTS idx_timings_time ON alert_timings(alert_time);
+CREATE INDEX IF NOT EXISTS idx_timings_camera_time ON alert_timings(camera, alert_time);
+"""
+
+
+def _parse_json_list(raw: str | None) -> list[str]:
+    if not raw:
+        return []
+    try:
+        parsed = json.loads(raw)
+        if isinstance(parsed, list):
+            return [str(x) for x in parsed]
+    except (json.JSONDecodeError, TypeError):
+        pass
+    return []
+
+
+def _feedback_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "review_id": row["review_id"],
+        "camera": row["camera"],
+        "severity": row["severity"],
+        "verdict": row["verdict"],
+        "corrected_label": row["corrected_label"],
+        "reason": row["reason"],
+        "start_time": float(row["start_time"]),
+        "updated_at": float(row["updated_at"]),
+    }
+
+
+def _golden_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "id": row["id"],
+        "review_id": row["review_id"],
+        "camera": row["camera"],
+        "severity": row["severity"],
+        "start_time": float(row["start_time"]),
+        "end_time": float(row["end_time"]) if row["end_time"] is not None else None,
+        "kind": row["kind"],
+        "object_label": row["object_label"],
+        "condition_tags": _parse_json_list(row["condition_tags"]),
+        "export_id": row["export_id"],
+        "video_path": row["video_path"],
+        "sidecar_path": row["sidecar_path"],
+        "notes": row["notes"],
+        "created_at": float(row["created_at"]),
+    }
+
+
+def _timing_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "review_id": row["review_id"],
+        "camera": row["camera"],
+        "alert_time": float(row["alert_time"]),
+        "discovery_ms": float(row["discovery_ms"]),
+        "resource_busy_ms": float(row["resource_busy_ms"]),
+        "confirmation_ms": float(row["confirmation_ms"]),
+        "total_ms": float(row["total_ms"]),
+    }
+
+
+class ReviewTrustStore:
+    """Thread-safe SQLite store for human feedback, golden clips, and alert timings."""
+
+    def __init__(self, db_path: str, exports_dir: str) -> None:
+        self.db_path = db_path
+        self.exports_dir = exports_dir
+        self.golden_clips_dir = os.path.join(exports_dir, "golden_clips")
+        self._lock = threading.RLock()
+        os.makedirs(os.path.dirname(db_path) or ".", exist_ok=True)
+        os.makedirs(self.golden_clips_dir, exist_ok=True)
+        with self._lock, self._connect() as conn:
+            conn.executescript(_SCHEMA)
+
+    def _connect(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(self.db_path, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        return conn
+
+    # ---- Human Feedback -----------------------------------------------------
+
+    def set_feedback(
+        self,
+        review_id: str,
+        camera: str,
+        severity: str,
+        verdict: str,
+        start_time: float,
+        corrected_label: str | None = None,
+        reason: str | None = None,
+        updated_at: float | None = None,
+    ) -> dict[str, Any]:
+        """Insert or update human feedback for a review segment."""
+        if verdict not in VALID_VERDICTS:
+            raise ValueError(
+                f"verdict must be one of {', '.join(VALID_VERDICTS)}; got {verdict!r}"
+            )
+        now = time.time() if updated_at is None else float(updated_at)
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                """
+                    INSERT INTO review_feedback (
+                        review_id, camera, severity, verdict, corrected_label,
+                        reason, start_time, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(review_id) DO UPDATE SET
+                        camera = excluded.camera,
+                        severity = excluded.severity,
+                        verdict = excluded.verdict,
+                        corrected_label = excluded.corrected_label,
+                        reason = excluded.reason,
+                        start_time = excluded.start_time,
+                        updated_at = excluded.updated_at
+                    """,
+                (
+                    review_id,
+                    camera,
+                    severity,
+                    verdict,
+                    corrected_label,
+                    reason,
+                    float(start_time),
+                    now,
+                ),
+            )
+            conn.commit()
+            row = conn.execute(
+                "SELECT * FROM review_feedback WHERE review_id = ?",
+                (review_id,),
+            ).fetchone()
+        assert row is not None
+        return _feedback_row_to_dict(row)
+
+    def clear_feedback(self, review_id: str) -> bool:
+        """Delete human feedback for a review segment. Returns True if a row was removed."""
+        with self._lock, self._connect() as conn:
+            cur = conn.execute(
+                "DELETE FROM review_feedback WHERE review_id = ?",
+                (review_id,),
+            )
+            conn.commit()
+            return cur.rowcount > 0
+
+    def get_feedback_map(
+        self,
+        start_time: float,
+        end_time: float,
+        cameras: list[str] | None = None,
+    ) -> dict[str, dict[str, Any]]:
+        """Return {review_id: feedback_dict} for segments starting in [start_time, end_time]."""
+        clauses = ["start_time >= ?", "start_time <= ?"]
+        params: list[Any] = [float(start_time), float(end_time)]
+        if cameras is not None:
+            if not cameras:
+                return {}
+            clauses.append(f"camera IN ({','.join('?' * len(cameras))})")
+            params.extend(cameras)
+
+        sql = f"SELECT * FROM review_feedback WHERE {' AND '.join(clauses)}"
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(sql, params).fetchall()
+        return {row["review_id"]: _feedback_row_to_dict(row) for row in rows}
+
+    def get_feedback_for_ids(self, review_ids: list[str]) -> dict[str, dict[str, Any]]:
+        """Return {review_id: feedback_dict} for the requested review IDs."""
+        if not review_ids:
+            return {}
+        out: dict[str, dict[str, Any]] = {}
+        with self._lock, self._connect() as conn:
+            for i in range(0, len(review_ids), 500):
+                chunk = review_ids[i : i + 500]
+                rows = conn.execute(
+                    f"SELECT * FROM review_feedback WHERE review_id IN ({','.join('?' * len(chunk))})",
+                    chunk,
+                ).fetchall()
+                for row in rows:
+                    out[row["review_id"]] = _feedback_row_to_dict(row)
+        return out
+
+    def count_unreviewed_fn(
+        self,
+        start_time: float | None = None,
+        end_time: float | None = None,
+        cameras: list[str] | None = None,
+    ) -> int:
+        """Count human-flagged false negatives (placeholder until paired with reviewed flag)."""
+        clauses = ["verdict = 'fn'"]
+        params: list[Any] = []
+        if start_time is not None:
+            clauses.append("start_time >= ?")
+            params.append(float(start_time))
+        if end_time is not None:
+            clauses.append("start_time <= ?")
+            params.append(float(end_time))
+        if cameras is not None:
+            if not cameras:
+                return 0
+            clauses.append(f"camera IN ({','.join('?' * len(cameras))})")
+            params.extend(cameras)
+        sql = f"SELECT COUNT(*) FROM review_feedback WHERE {' AND '.join(clauses)}"
+        with self._lock, self._connect() as conn:
+            row = conn.execute(sql, params).fetchone()
+        return int(row[0]) if row else 0
+
+    # ---- Alert Timings ------------------------------------------------------
+
+    def record_alert_timing(
+        self,
+        review_id: str,
+        camera: str,
+        alert_time: float,
+        discovery_ms: float = 0.0,
+        resource_busy_ms: float = 0.0,
+        confirmation_ms: float = 0.0,
+        total_ms: float | None = None,
+    ) -> dict[str, Any]:
+        """Record latency breakdown for a newly created alert review segment."""
+        disc = max(0.0, float(discovery_ms))
+        busy = max(0.0, float(resource_busy_ms))
+        conf = max(0.0, float(confirmation_ms))
+        total = (
+            max(0.0, float(total_ms)) if total_ms is not None else disc + busy + conf
+        )
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                """
+                    INSERT INTO alert_timings (
+                        review_id, camera, alert_time, discovery_ms,
+                        resource_busy_ms, confirmation_ms, total_ms
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(review_id) DO UPDATE SET
+                        camera = excluded.camera,
+                        alert_time = excluded.alert_time,
+                        discovery_ms = excluded.discovery_ms,
+                        resource_busy_ms = excluded.resource_busy_ms,
+                        confirmation_ms = excluded.confirmation_ms,
+                        total_ms = excluded.total_ms
+                    """,
+                (
+                    review_id,
+                    camera,
+                    float(alert_time),
+                    disc,
+                    busy,
+                    conf,
+                    total,
+                ),
+            )
+            conn.commit()
+            row = conn.execute(
+                "SELECT * FROM alert_timings WHERE review_id = ?",
+                (review_id,),
+            ).fetchone()
+        assert row is not None
+        return _timing_row_to_dict(row)
+
+    def get_timings_in_range(
+        self,
+        start_time: float,
+        end_time: float,
+        cameras: list[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Return alert timing rows within [start_time, end_time]."""
+        clauses = ["alert_time >= ?", "alert_time <= ?"]
+        params: list[Any] = [float(start_time), float(end_time)]
+        if cameras is not None:
+            if not cameras:
+                return []
+            clauses.append(f"camera IN ({','.join('?' * len(cameras))})")
+            params.extend(cameras)
+
+        sql = (
+            f"SELECT * FROM alert_timings WHERE {' AND '.join(clauses)} "
+            "ORDER BY alert_time ASC"
+        )
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(sql, params).fetchall()
+        return [_timing_row_to_dict(row) for row in rows]
+
+    # ---- Golden Clips -------------------------------------------------------
+
+    def create_golden_clip(
+        self,
+        *,
+        camera: str,
+        severity: str,
+        start_time: float,
+        end_time: float | None = None,
+        kind: str = "tp",
+        review_id: str | None = None,
+        object_label: str | None = None,
+        condition_tags: list[str] | None = None,
+        export_id: str | None = None,
+        video_path: str | None = None,
+        source_video_path: str | None = None,
+        notes: str | None = None,
+        clip_id: str | None = None,
+        created_at: float | None = None,
+    ) -> dict[str, Any]:
+        """Persist a Golden Clip row and write its paired ``<id>.json`` sidecar."""
+        if kind not in VALID_GOLDEN_KINDS:
+            raise ValueError(
+                f"kind must be one of {', '.join(VALID_GOLDEN_KINDS)}; got {kind!r}"
+            )
+        cid = clip_id or f"gc_{uuid.uuid4().hex[:12]}"
+        now = time.time() if created_at is None else float(created_at)
+        tags = [str(t).strip() for t in (condition_tags or []) if str(t).strip()]
+
+        os.makedirs(self.golden_clips_dir, exist_ok=True)
+        resolved_video_path = video_path
+        if source_video_path and os.path.isfile(source_video_path):
+            ext = os.path.splitext(source_video_path)[1] or ".mp4"
+            dest_video_path = os.path.join(self.golden_clips_dir, f"{cid}{ext}")
+            if os.path.abspath(source_video_path) != os.path.abspath(dest_video_path):
+                shutil.copy2(source_video_path, dest_video_path)
+            resolved_video_path = dest_video_path
+
+        sidecar_path = os.path.join(self.golden_clips_dir, f"{cid}.json")
+        sidecar_payload = {
+            "id": cid,
+            "review_id": review_id,
+            "camera": camera,
+            "severity": severity,
+            "start_time": float(start_time),
+            "end_time": float(end_time) if end_time is not None else None,
+            "kind": kind,
+            "object_label": object_label,
+            "condition_tags": tags,
+            "export_id": export_id,
+            "video_path": resolved_video_path,
+            "notes": notes,
+            "created_at": now,
+        }
+        with open(sidecar_path, "w", encoding="utf-8") as f:
+            json.dump(sidecar_payload, f, indent=2, sort_keys=True)
+
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                """
+                    INSERT INTO golden_clips (
+                        id, review_id, camera, severity, start_time, end_time,
+                        kind, object_label, condition_tags, export_id,
+                        video_path, sidecar_path, notes, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                (
+                    cid,
+                    review_id,
+                    camera,
+                    severity,
+                    float(start_time),
+                    float(end_time) if end_time is not None else None,
+                    kind,
+                    object_label,
+                    json.dumps(tags),
+                    export_id,
+                    resolved_video_path,
+                    sidecar_path,
+                    notes,
+                    now,
+                ),
+            )
+            conn.commit()
+            row = conn.execute(
+                "SELECT * FROM golden_clips WHERE id = ?", (cid,)
+            ).fetchone()
+        assert row is not None
+        return _golden_row_to_dict(row)
+
+    def get_golden_clip(self, clip_id: str) -> dict[str, Any] | None:
+        """Fetch a single golden clip record by ID."""
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM golden_clips WHERE id = ?", (clip_id,)
+            ).fetchone()
+        return _golden_row_to_dict(row) if row else None
+
+    def list_golden_clips(
+        self,
+        start_time: float | None = None,
+        end_time: float | None = None,
+        cameras: list[str] | None = None,
+        severity: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """List golden clips optionally filtered by time window, cameras, and severity."""
+        clauses: list[str] = []
+        params: list[Any] = []
+        if start_time is not None:
+            clauses.append("start_time >= ?")
+            params.append(float(start_time))
+        if end_time is not None:
+            clauses.append("start_time <= ?")
+            params.append(float(end_time))
+        if cameras is not None:
+            if not cameras:
+                return []
+            clauses.append(f"camera IN ({','.join('?' * len(cameras))})")
+            params.extend(cameras)
+        if severity is not None:
+            clauses.append("severity = ?")
+            params.append(severity)
+
+        where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+        sql = f"SELECT * FROM golden_clips{where} ORDER BY start_time DESC, created_at DESC"
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(sql, params).fetchall()
+        return [_golden_row_to_dict(row) for row in rows]
+
+    def delete_golden_clip(self, clip_id: str) -> bool:
+        """Delete a golden clip row and remove its sidecar (and copied clip inside golden_clips_dir)."""
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
+                "SELECT sidecar_path, video_path FROM golden_clips WHERE id = ?",
+                (clip_id,),
+            ).fetchone()
+            if row is None:
+                return False
+            conn.execute("DELETE FROM golden_clips WHERE id = ?", (clip_id,))
+            conn.commit()
+
+        sidecar_path = row["sidecar_path"]
+        video_path = row["video_path"]
+        if sidecar_path:
+            try:
+                os.remove(sidecar_path)
+            except OSError:
+                pass
+        if video_path and os.path.abspath(video_path).startswith(
+            os.path.abspath(self.golden_clips_dir) + os.sep
+        ):
+            try:
+                os.remove(video_path)
+            except OSError:
+                pass
+        return True
+
+    def get_golden_summary(
+        self,
+        cameras: list[str] | None = None,
+    ) -> dict[str, Any]:
+        """Return total count, condition_tags coverage counts, and clips list."""
+        clips = self.list_golden_clips(cameras=cameras)
+        coverage = {tag: 0 for tag in COVERAGE_CONDITIONS}
+        for clip in clips:
+            clip_tags = set(clip.get("condition_tags") or [])
+            for tag in COVERAGE_CONDITIONS:
+                if tag in clip_tags:
+                    coverage[tag] += 1
+        return {
+            "total": len(clips),
+            "coverage": coverage,
+            "clips": clips,
+        }
+
+
+# Process-wide store singleton (mirrors Secondlook's SaveAndReviewStore pattern)
+_trust_store: ReviewTrustStore | None = None
+_trust_store_lock = threading.Lock()
+
+
+def init_review_trust_store(db_path: str, exports_dir: str) -> ReviewTrustStore:
+    """Initialize and register the process-wide ReviewTrustStore."""
+    global _trust_store
+    with _trust_store_lock:
+        _trust_store = ReviewTrustStore(db_path, exports_dir)
+        return _trust_store
+
+
+def get_review_trust_store() -> ReviewTrustStore | None:
+    """Return the process-wide ReviewTrustStore, or None if not initialized."""
+    return _trust_store
+
+
+def default_trust_db_path(frigate_db_path: str) -> str:
+    """Derive ``review_trust.db`` beside Frigate's configured database path."""
+    db_dir = os.path.dirname(frigate_db_path) or "."
+    return os.path.join(db_dir, "review_trust.db")
