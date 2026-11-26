@@ -201,8 +201,10 @@ export default function ReviewTrustOverview({
     const params: Record<string, string | number | boolean> = {
       severity,
       bar_size: barSize,
-      reviewed: showReviewed ? 1 : 0,
     };
+    if (!showReviewed) {
+      params.reviewed = 0;
+    }
     if (filter?.cameras?.length) {
       params.cameras = filter.cameras.join(",");
     }

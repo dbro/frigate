@@ -354,9 +354,11 @@ async def get_review_overview(
         .dicts()
     )
 
-    # Optional UserReviewStatus lookup when reviewed filter is requested
+    # Optional UserReviewStatus lookup when unreviewed-only filter (reviewed=0) is requested.
+    # Matches stock frigate/api/review.py: reviewed=0 shows only unreviewed items;
+    # reviewed=1 (or None) shows ALL items (both reviewed and unreviewed).
     reviewed_ids: set[str] | None = None
-    if reviewed in (0, 1) and rows:
+    if reviewed == 0 and rows:
         seg_ids = [r["id"] for r in rows]
         try:
             user_id = request.headers.get("remote-user") or "admin"
@@ -412,12 +414,8 @@ async def get_review_overview(
             if max_score is not None and score_val > max_score:
                 continue
 
-        if reviewed_ids is not None:
-            is_rev = r["id"] in reviewed_ids
-            if reviewed == 1 and not is_rev:
-                continue
-            if reviewed == 0 and is_rev:
-                continue
+        if reviewed_ids is not None and r["id"] in reviewed_ids:
+            continue
 
         filtered_segments.append(r)
 
