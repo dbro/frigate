@@ -55,6 +55,8 @@ export interface GoldenClipsResponse {
 export interface TrustOverviewBucketAbove {
   alerts: number;
   detections: number;
+  tp?: number;
+  good?: number;
   rescued_fn: number;
   auto_suppressed_fp: number;
   auto_misclassified: number;

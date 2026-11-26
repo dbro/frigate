@@ -105,14 +105,12 @@ export default function ReviewFeedbackBar({
     setSavingGolden(true);
     const inferredKind =
       currentVerdict === "fn"
-        ? "Human FN"
+        ? "fn"
         : currentVerdict === "fp"
-          ? "Human FP"
+          ? "fp"
           : currentVerdict === "misclassified"
-            ? "Misclassified"
-            : review.severity === "alert"
-              ? "Alert Specimen"
-              : "Detection Specimen";
+            ? "misclassified"
+            : "tp";
 
     const body: CreateGoldenClipBody = {
       kind: inferredKind,

@@ -291,22 +291,26 @@ export default function ReviewTrustOverview({
     let maxDownVal = 2;
 
     for (const b of buckets) {
+      const aboveAlerts = b.above.alerts ?? b.above.tp ?? 0;
+      const aboveDetections = b.above.detections ?? b.above.tp ?? 0;
       const upSum = isAlerts
-        ? b.above.alerts + b.above.rescued_fn + b.above.auto_misclassified
-        : b.above.detections +
-          b.above.auto_suppressed_fp +
-          b.above.auto_misclassified +
-          b.above.background_clips;
+        ? aboveAlerts +
+          (b.above.rescued_fn ?? 0) +
+          (b.above.auto_misclassified ?? 0)
+        : aboveDetections +
+          (b.above.auto_suppressed_fp ?? 0) +
+          (b.above.auto_misclassified ?? 0) +
+          (b.above.background_clips ?? 0);
       const downSum = isAlerts
-        ? b.below.fp + b.below.misclassified
-        : b.below.fn + b.below.fp + b.below.misclassified;
+        ? (b.below.fp ?? 0) + (b.below.misclassified ?? 0)
+        : (b.below.fn ?? 0) + (b.below.fp ?? 0) + (b.below.misclassified ?? 0);
 
       if (upSum > maxUpVal) maxUpVal = upSum;
       if (downSum > maxDownVal) maxDownVal = downSum;
     }
 
     return {
-      niceUp: Math.ceil(maxUpVal / 5) * 5,
+      niceUp: Math.max(5, Math.ceil(maxUpVal / 5) * 5),
       niceDown: Math.max(2, Math.ceil(maxDownVal / 2) * 2),
     };
   }, [buckets, isAlerts]);
@@ -607,21 +611,33 @@ export default function ReviewTrustOverview({
 
               const upSegments = isAlerts
                 ? [
-                    { val: bucket.above.alerts, color: "#3b82f6" },
-                    { val: bucket.above.rescued_fn, color: "#2dd4bf" },
-                    { val: bucket.above.auto_misclassified, color: "#facc15" },
+                    {
+                      val: bucket.above.alerts ?? bucket.above.tp ?? 0,
+                      color: "#3b82f6",
+                    },
+                    { val: bucket.above.rescued_fn ?? 0, color: "#2dd4bf" },
+                    {
+                      val: bucket.above.auto_misclassified ?? 0,
+                      color: "#facc15",
+                    },
                   ]
                 : [
-                    { val: bucket.above.detections, color: "#64748b" },
                     {
-                      val: bucket.above.auto_suppressed_fp,
+                      val: bucket.above.detections ?? bucket.above.tp ?? 0,
+                      color: "#64748b",
+                    },
+                    {
+                      val: bucket.above.auto_suppressed_fp ?? 0,
                       color: "#e17087",
                     },
-                    { val: bucket.above.auto_misclassified, color: "#facc15" },
                     {
-                      val: bucket.above.background_clips,
+                      val: bucket.above.auto_misclassified ?? 0,
+                      color: "#facc15",
+                    },
+                    {
+                      val: bucket.above.background_clips ?? 0,
                       color: "transparent",
-                      outline: "#e2e8f0",
+                      outline: "currentColor",
                     },
                   ];
 
@@ -629,8 +645,10 @@ export default function ReviewTrustOverview({
               const upRects = upSegments
                 .filter((seg) => seg.val > 0)
                 .map((seg, segIdx) => {
-                  const h = Math.max(1.5, (seg.val / niceUp) * upH);
-                  curUpY -= h;
+                  const rawH = Math.max(1.5, (seg.val / niceUp) * upH);
+                  const clampedTop = Math.max(padT, curUpY - rawH);
+                  const h = Math.max(0, curUpY - clampedTop);
+                  curUpY = clampedTop;
                   return (
                     <rect
                       key={`up-${segIdx}`}
@@ -641,6 +659,7 @@ export default function ReviewTrustOverview({
                       rx={1.5}
                       fill={seg.color}
                       stroke={"outline" in seg ? seg.outline : undefined}
+                      strokeOpacity={"outline" in seg ? 0.65 : undefined}
                       strokeWidth={"outline" in seg ? 1.5 : undefined}
                     />
                   );
@@ -837,8 +856,8 @@ export default function ReviewTrustOverview({
                       x2={W - padR}
                       y1={y}
                       y2={y}
-                      stroke={isGoal ? "#f8fafc" : "currentColor"}
-                      strokeOpacity={isGoal ? 0.55 : 0.12}
+                      stroke="currentColor"
+                      strokeOpacity={isGoal ? 0.5 : 0.12}
                       strokeDasharray={isGoal ? "5 4" : undefined}
                     />
                     <text
@@ -865,12 +884,26 @@ export default function ReviewTrustOverview({
                   5
                 }
                 textAnchor="end"
-                fill="#f8fafc"
-                fillOpacity={0.75}
+                fill="currentColor"
+                fillOpacity={0.7}
                 fontSize={10}
               >
                 2.0s Goal
               </text>
+
+              {!buckets.some((b) => (b.timing?.count ?? 0) > 0) && (
+                <text
+                  x={padL + plotW / 2}
+                  y={timingPadT + timingPlotH / 2 + 4}
+                  textAnchor="middle"
+                  fill="currentColor"
+                  fillOpacity={0.5}
+                  fontSize={12}
+                >
+                  No alert timing samples in this window yet — recorded live for
+                  new alerts
+                </text>
+              )}
 
               {buckets.map((bucket, idx) => {
                 const cx = padL + idx * slotW + slotW / 2;

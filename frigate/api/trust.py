@@ -152,12 +152,17 @@ def _fetch_event_scores(event_ids: set[str]) -> dict[str, float]:
     return scores
 
 
-def _empty_bucket(bucket_start: float, bucket_end: float) -> dict[str, Any]:
+def _empty_bucket(
+    index: int, bucket_start: float, bucket_end: float
+) -> dict[str, Any]:
     return {
+        "index": index,
         "start_time": bucket_start,
         "end_time": bucket_end,
         "above": {
             "total": 0,
+            "alerts": 0,
+            "detections": 0,
             "tp": 0,
             "good": 0,
             "rescued_fn": 0,
@@ -302,6 +307,7 @@ async def get_review_overview(
 
     buckets = [
         _empty_bucket(
+            i,
             window_start + i * bar_seconds,
             window_start + (i + 1) * bar_seconds,
         )
@@ -433,6 +439,7 @@ async def get_review_overview(
             continue
         bucket = buckets[idx]
         fb = feedback_map.get(seg_id)
+        above_key = "alerts" if severity == "alert" else "detections"
         if fb is not None:
             feedback_by_review_id[seg_id] = fb
             verdict = fb["verdict"]
@@ -442,10 +449,12 @@ async def get_review_overview(
                 continue
             if verdict == "good":
                 bucket["above"]["good"] += 1
+                bucket["above"][above_key] += 1
                 bucket["above"]["total"] += 1
                 continue
 
         bucket["above"]["tp"] += 1
+        bucket["above"][above_key] += 1
         bucket["above"]["total"] += 1
 
     # Include any human-flagged FN feedback in this window that was NOT already
