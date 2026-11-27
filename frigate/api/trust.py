@@ -214,6 +214,7 @@ def _empty_bucket(
         "golden_clips": [],
         "timing": {
             "count": 0,
+            "segment_count": 0,
             "avg_discovery_ms": 0.0,
             "avg_resource_busy_ms": 0.0,
             "avg_confirmation_ms": 0.0,
@@ -240,20 +241,22 @@ def _query_secondlook_analyses(
     window_end: float,
     cameras: list[str],
     label_filter: list[str] | None,
+    zone_filter: list[str] | None = None,
 ) -> tuple[dict[str, dict[str, Any]], list[dict[str, Any]]]:
     """Load Secondlook ``analyses`` rows for matching against ReviewSegments.
 
-    Returns ``(by_event_id, suppressed_fp_rows)`` where:
+    Returns ``(by_event_id, suppressed_fp_items)`` where:
     - ``by_event_id`` maps ``event_id`` (padded +-1h around the window so tracks
       ending slightly after a segment start still match) to Secondlook details.
-    - ``suppressed_fp_rows`` holds ``live_outcome == 'fp_suppressed'`` rows
-      strictly within ``[window_start, window_end)`` (these never create a
-      Frigate ReviewSegment and appear in the Detections chart above the line).
+    - ``suppressed_fp_items`` holds ``live_outcome == 'fp_suppressed'`` items
+      whose timestamp falls in ``[window_start, window_end)``, enriched with
+      their saved ``examples`` still image ID when available so the Detections
+      grid can render their thumbnails directly.
     """
     by_event_id: dict[str, dict[str, Any]] = {}
-    suppressed_fp_rows: list[dict[str, Any]] = []
+    suppressed_fp_items: list[dict[str, Any]] = []
     if sl_store is None or not cameras:
-        return by_event_id, suppressed_fp_rows
+        return by_event_id, suppressed_fp_items
 
     pad = 3600.0
     clauses = ["end_time >= ?", "end_time < ?"]
@@ -266,11 +269,12 @@ def _query_secondlook_analyses(
         params.extend(label_filter)
 
     sql = (
-        "SELECT event_id, track_id, label, end_time, live, live_outcome, "
-        "misclass_label, primary_score, sl_score, factor "
+        "SELECT camera, event_id, track_id, label, start_time, end_time, live, "
+        "live_outcome, misclass_label, primary_score, sl_score, factor "
         f"FROM analyses WHERE {' AND '.join(clauses)}"
     )
 
+    examples_by_track: dict[tuple[str, str], dict[str, Any]] = {}
     try:
         with sl_store._lock, sl_store._connect() as conn:
             has_analyses = conn.execute(
@@ -280,19 +284,80 @@ def _query_secondlook_analyses(
                 rows = conn.execute(sql, params).fetchall()
             else:
                 rows = []
+
+            has_examples = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='examples'"
+            ).fetchone()
+            if has_examples and rows:
+                suppressed_tracks = [
+                    (str(r["camera"]), str(r["track_id"]))
+                    for r in rows
+                    if r["live_outcome"] == "fp_suppressed"
+                ]
+                if suppressed_tracks:
+                    ex_clauses = [
+                        "kind = 'false_positive'",
+                        f"camera IN ({','.join('?' * len(cameras))})",
+                        "COALESCE(frame_time, created_at) >= ?",
+                        "COALESCE(frame_time, created_at) < ?",
+                    ]
+                    ex_params: list[Any] = [
+                        *cameras,
+                        window_start - pad,
+                        window_end + pad,
+                    ]
+                    ex_rows = conn.execute(
+                        "SELECT id, camera, track_id, frame_time, still_path, "
+                        "zones, mark, created_at "
+                        f"FROM examples WHERE {' AND '.join(ex_clauses)} "
+                        "ORDER BY created_at DESC",
+                        ex_params,
+                    ).fetchall()
+                    for ex in ex_rows:
+                        key = (str(ex["camera"]), str(ex["track_id"]))
+                        if key not in examples_by_track:
+                            raw_zones = ex["zones"]
+                            parsed_zones: list[str] = []
+                            if raw_zones:
+                                try:
+                                    import json as _json
+
+                                    z = _json.loads(raw_zones)
+                                    if isinstance(z, list):
+                                        parsed_zones = [str(v) for v in z]
+                                except (ValueError, TypeError):
+                                    pass
+                            examples_by_track[key] = {
+                                "example_id": str(ex["id"]),
+                                "frame_time": (
+                                    float(ex["frame_time"])
+                                    if ex["frame_time"] is not None
+                                    else None
+                                ),
+                                "has_still": bool(ex["still_path"]),
+                                "zones": parsed_zones,
+                                "mark": ex["mark"],
+                            }
     except sqlite3.Error:
         logger.debug("Secondlook analyses lookup failed", exc_info=True)
-        return by_event_id, suppressed_fp_rows
+        return by_event_id, suppressed_fp_items
 
     for row in rows:
+        cam = str(row["camera"])
+        track_id = str(row["track_id"])
+        start_ts = (
+            float(row["start_time"]) if row["start_time"] is not None else None
+        )
         end_ts = float(row["end_time"])
         live = row["live"]
         live_outcome = row["live_outcome"]
         event_id = row["event_id"]
         info = {
+            "camera": cam,
             "event_id": event_id,
-            "track_id": row["track_id"],
+            "track_id": track_id,
             "label": row["label"],
+            "start_time": start_ts,
             "end_time": end_ts,
             "live": live,
             "live_outcome": live_outcome,
@@ -315,13 +380,45 @@ def _query_secondlook_analyses(
         }
         if event_id:
             by_event_id[str(event_id)] = info
-        if (
-            live_outcome == "fp_suppressed"
-            and window_start <= end_ts < window_end
-        ):
-            suppressed_fp_rows.append(info)
+        if live_outcome == "fp_suppressed":
+            ex_info = examples_by_track.get((cam, track_id))
+            item_ts = (
+                ex_info["frame_time"]
+                if ex_info and ex_info["frame_time"] is not None
+                else (start_ts if start_ts is not None else end_ts)
+            )
+            if not (window_start <= item_ts < window_end):
+                continue
+            item_zones = ex_info["zones"] if ex_info else []
+            if zone_filter is not None and item_zones:
+                if not any(z in item_zones for z in zone_filter):
+                    continue
+            duration_sec = (
+                round(max(0.0, end_ts - start_ts), 2)
+                if start_ts is not None
+                else None
+            )
+            suppressed_fp_items.append(
+                {
+                    "id": ex_info["example_id"] if ex_info else f"sl_{track_id}",
+                    "example_id": ex_info["example_id"] if ex_info else None,
+                    "track_id": track_id,
+                    "camera": cam,
+                    "label": row["label"],
+                    "start_time": item_ts,
+                    "end_time": end_ts,
+                    "duration_sec": duration_sec,
+                    "primary_score": info["primary_score"],
+                    "sl_score": info["sl_score"],
+                    "factor": info["factor"],
+                    "zones": item_zones,
+                    "mark": ex_info["mark"] if ex_info else None,
+                    "has_still": bool(ex_info and ex_info["has_still"]),
+                }
+            )
 
-    return by_event_id, suppressed_fp_rows
+    suppressed_fp_items.sort(key=lambda item: item["start_time"], reverse=True)
+    return by_event_id, suppressed_fp_items
 
 
 def _normalize_timing_row(
@@ -416,6 +513,7 @@ async def get_review_overview(
                 "buckets": buckets,
                 "feedback_by_review_id": {},
                 "review_meta_by_id": {},
+                "suppressed_fp_items": [],
             }
         )
 
@@ -515,15 +613,17 @@ async def get_review_overview(
     # Secondlook analyses lookup by event_id so each ReviewSegment is classified
     # into EXACTLY ONE category (never double-counted across alerts + rescued_fn
     # / auto_misclassified).
-    sl_by_event_id, suppressed_fp_rows = _query_secondlook_analyses(
+    sl_by_event_id, suppressed_fp_items = _query_secondlook_analyses(
         sl_store,
         window_start=window_start,
         window_end=resolved_end,
         cameras=camera_list,
         label_filter=label_filter,
+        zone_filter=zone_filter,
     )
 
-    # Per-review timing lookup for thumbnail info badges
+    # Per-review timing lookup for both thumbnail info badges AND timing chart
+    # (ensures timing bars share exact same segment filtering & bucket index).
     seg_timings_raw = trust_store.get_timings_for_ids(
         [seg["id"] for seg in filtered_segments]
     )
@@ -535,6 +635,7 @@ async def get_review_overview(
     # 4. Otherwise -> above.alerts (alert view) or above.detections (detection view)
     feedback_by_review_id: dict[str, dict[str, Any]] = {}
     review_meta_by_id: dict[str, dict[str, Any]] = {}
+    timings_by_bucket: dict[int, list[dict[str, Any]]] = {}
     above_key = "alerts" if severity == "alert" else "detections"
 
     for seg in filtered_segments:
@@ -545,6 +646,7 @@ async def get_review_overview(
         if idx is None:
             continue
         bucket = buckets[idx]
+        bucket["timing"]["segment_count"] += 1
         data = seg.get("data") if isinstance(seg.get("data"), dict) else {}
         det_ids = [str(eid) for eid in (data.get("detections") or [])]
 
@@ -645,6 +747,8 @@ async def get_review_overview(
             if raw_timing is not None
             else None
         )
+        if norm_timing is not None:
+            timings_by_bucket.setdefault(idx, []).append(norm_timing)
 
         review_meta_by_id[seg_id] = {
             "category": category,
@@ -693,10 +797,10 @@ async def get_review_overview(
 
     # Detections view only: stack Secondlook auto-suppressed FPs above the line.
     # Suppressed FPs never generate a Frigate ReviewSegment (event_id is NULL)
-    # and live in the Corrections tab.
+    # and are returned in suppressed_fp_items so thumbnails appear below.
     if severity == "detection":
-        for sl_row in suppressed_fp_rows:
-            idx = _bucket_index(sl_row["end_time"], window_start, bar_seconds)
+        for sl_item in suppressed_fp_items:
+            idx = _bucket_index(sl_item["start_time"], window_start, bar_seconds)
             if idx is None:
                 continue
             buckets[idx]["above"]["auto_suppressed_fp"] += 1
@@ -718,26 +822,41 @@ async def get_review_overview(
         if clip["severity"] == severity or clip["kind"] == "background":
             buckets[idx]["golden_clips"].append(clip)
 
-    # Alert / detection timings per bucket (averages + slowest).
-    # Filter by severity, force confirmation_ms=0 on detection view, and skip
-    # pre-fix legacy outlier rows exceeding MAX_VALID_TIMING_MS (30s).
-    timings = trust_store.get_timings_in_range(
-        window_start, resolved_end, cameras=camera_list, severity=severity
+    # Also include any timing rows whose review_id wasn't matched via
+    # filtered_segments only when no segment-level filters are active (covers
+    # live in-progress or pruned segments while preserving exact alignment when
+    # filtered segments exist).
+    has_segment_filters = any(
+        [
+            label_filter,
+            zone_filter,
+            sub_label_filter,
+            min_score is not None,
+            max_score is not None,
+            reviewed == 0,
+        ]
     )
-    timings_by_bucket: dict[int, list[dict[str, Any]]] = {}
-    for row in timings:
-        norm = _normalize_timing_row(row, severity)
-        if norm is None:
-            continue
-        idx = _bucket_index(norm["alert_time"], window_start, bar_seconds)
-        if idx is not None:
-            timings_by_bucket.setdefault(idx, []).append(norm)
+    if not has_segment_filters:
+        all_window_timings = trust_store.get_timings_in_range(
+            window_start, resolved_end, cameras=camera_list, severity=severity
+        )
+        for row in all_window_timings:
+            if row["review_id"] in seen_ids:
+                continue
+            norm = _normalize_timing_row(row, severity)
+            if norm is None:
+                continue
+            idx = _bucket_index(norm["alert_time"], window_start, bar_seconds)
+            if idx is not None:
+                timings_by_bucket.setdefault(idx, []).append(norm)
 
     for idx, rows_in_bucket in timings_by_bucket.items():
         n = len(rows_in_bucket)
         slowest = max(rows_in_bucket, key=lambda item: item["total_ms"])
+        seg_cnt = buckets[idx]["timing"]["segment_count"]
         buckets[idx]["timing"] = {
             "count": n,
+            "segment_count": max(seg_cnt, n),
             "avg_discovery_ms": round(
                 sum(r["discovery_ms"] for r in rows_in_bucket) / n, 2
             ),
@@ -772,6 +891,7 @@ async def get_review_overview(
             "buckets": buckets,
             "feedback_by_review_id": feedback_by_review_id,
             "review_meta_by_id": review_meta_by_id,
+            "suppressed_fp_items": suppressed_fp_items if severity == "detection" else [],
         }
     )
 

@@ -104,10 +104,12 @@ import CorrectionsView from "./CorrectionsView";
 import ReviewTrustOverview from "@/components/events/ReviewTrustOverview";
 import ReviewFeedbackBar from "@/components/events/ReviewFeedbackBar";
 import ReviewClipInfoBadge from "@/components/events/ReviewClipInfoBadge";
+import SuppressedFpCard from "@/components/events/SuppressedFpCard";
 import {
   GoldenClipSummary,
   ReviewClipMeta,
   ReviewFeedbackItem,
+  SuppressedFpItem,
   TrustCategoryFilter,
 } from "@/types/reviewTrust";
 import { EmptyCard } from "@/components/card/EmptyCard";
@@ -726,6 +728,9 @@ function DetectionReview({
   const [reviewMetaById, setReviewMetaById] = useState<
     Record<string, ReviewClipMeta>
   >({});
+  const [suppressedFpItems, setSuppressedFpItems] = useState<
+    SuppressedFpItem[]
+  >([]);
   const [activeTrustCategory, setActiveTrustCategory] =
     useState<TrustCategoryFilter | null>(null);
   const [goldenReviewIds, setGoldenReviewIds] = useState<Set<string>>(
@@ -775,6 +780,52 @@ function DetectionReview({
     reviewMetaById,
     goldenReviewIds,
   ]);
+
+  const visibleSuppressedFpItems = useMemo(() => {
+    if (severity !== "detection") {
+      return [];
+    }
+    if (
+      activeTrustCategory !== null &&
+      activeTrustCategory !== "auto_suppressed_fp"
+    ) {
+      return [];
+    }
+    return suppressedFpItems.filter((item) => {
+      if (filter?.after != null && item.start_time < filter.after) {
+        return false;
+      }
+      if (filter?.before != null && item.start_time >= filter.before) {
+        return false;
+      }
+      return true;
+    });
+  }, [
+    severity,
+    activeTrustCategory,
+    suppressedFpItems,
+    filter?.after,
+    filter?.before,
+  ]);
+
+  const mergedGridItems = useMemo(() => {
+    const entries: (
+      | { kind: "review"; start_time: number; review: ReviewSegment }
+      | { kind: "suppressed_fp"; start_time: number; item: SuppressedFpItem }
+    )[] = [];
+    for (const seg of displayedItems ?? []) {
+      entries.push({ kind: "review", start_time: seg.start_time, review: seg });
+    }
+    for (const item of visibleSuppressedFpItems) {
+      entries.push({
+        kind: "suppressed_fp",
+        start_time: item.start_time,
+        item,
+      });
+    }
+    entries.sort((a, b) => b.start_time - a.start_time);
+    return entries;
+  }, [displayedItems, visibleSuppressedFpItems]);
 
   const reviewTimelineRef = useRef<HTMLDivElement>(null);
 
@@ -1096,6 +1147,7 @@ function DetectionReview({
             onGoldenReviewIdsChange={setGoldenReviewIds}
             onFeedbackMapChange={setFeedbackByReviewId}
             onReviewMetaMapChange={setReviewMetaById}
+            onSuppressedFpItemsChange={setSuppressedFpItems}
             onUnreviewedFnCountChange={onUnreviewedFnCountChange}
           />
         )}
@@ -1108,8 +1160,8 @@ function DetectionReview({
               </span>
               {activeTrustCategory === "auto_suppressed_fp" ? (
                 <span className="text-muted-foreground">
-                  Auto-suppressed FPs did not generate Frigate clips and are
-                  stored in the Corrections tab.
+                  Showing {visibleSuppressedFpItems.length} auto-suppressed FP{" "}
+                  {visibleSuppressedFpItems.length === 1 ? "clip" : "clips"}
                 </span>
               ) : activeTrustCategory === "background_clips" ? (
                 <span className="text-muted-foreground">
@@ -1184,7 +1236,7 @@ function DetectionReview({
         )}
 
         {!loading &&
-          displayedItems?.length === 0 &&
+          mergedGridItems.length === 0 &&
           activeTrustCategory === null && (
             <div className="mx-auto py-8">
               <EmptyCard
@@ -1198,9 +1250,8 @@ function DetectionReview({
           )}
 
         {!loading &&
-          displayedItems?.length === 0 &&
+          mergedGridItems.length === 0 &&
           activeTrustCategory !== null &&
-          activeTrustCategory !== "auto_suppressed_fp" &&
           activeTrustCategory !== "background_clips" && (
             <div className="mx-auto py-8 text-center text-sm text-muted-foreground">
               No items in this view match{" "}
@@ -1215,8 +1266,30 @@ function DetectionReview({
           className="grid w-full gap-2 px-1 sm:grid-cols-2 md:mx-2 md:grid-cols-3 md:gap-4 3xl:grid-cols-4"
           ref={contentRef}
         >
-          {!loading && displayedItems
-            ? displayedItems.map((value) => {
+          {!loading && currentItems
+            ? mergedGridItems.map((entry) => {
+                if (entry.kind === "suppressed_fp") {
+                  return (
+                    <SuppressedFpCard
+                      key={`sl-fp-${entry.item.id}-${entry.item.track_id}`}
+                      item={entry.item}
+                      onOpenRecording={(camera, ts) =>
+                        onOpenRecording({
+                          camera,
+                          startTime: ts - REVIEW_PADDING,
+                          severity: "detection",
+                        })
+                      }
+                      onOpenInCorrections={
+                        onOpenCorrections
+                          ? () => onOpenCorrections("false_positive", "acted")
+                          : undefined
+                      }
+                    />
+                  );
+                }
+
+                const value = entry.review;
                 const selected = selectedReviews.some((r) => r.id === value.id);
 
                 return (

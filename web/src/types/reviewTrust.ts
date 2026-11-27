@@ -83,6 +83,7 @@ export interface TrustOverviewBucketBelow {
 
 export interface TrustOverviewBucketTiming {
   count: number;
+  segment_count?: number;
   avg_discovery_ms: number;
   avg_resource_busy_ms: number;
   avg_confirmation_ms: number;
@@ -145,6 +146,23 @@ export interface ReviewClipMeta {
   secondlook?: ReviewClipSecondlookInfo | null;
 }
 
+export interface SuppressedFpItem {
+  id: string;
+  example_id?: string | null;
+  track_id: string;
+  camera: string;
+  label: string;
+  start_time: number;
+  end_time: number;
+  duration_sec?: number | null;
+  primary_score?: number | null;
+  sl_score?: number | null;
+  factor?: number | null;
+  zones: string[];
+  mark?: string | null;
+  has_still: boolean;
+}
+
 export interface ReviewOverviewResponse {
   severity: ReviewOverviewSeverity;
   bar_size: ReviewOverviewBarSize;
@@ -157,4 +175,5 @@ export interface ReviewOverviewResponse {
   buckets: TrustOverviewBucket[];
   feedback_by_review_id: Record<string, ReviewFeedbackItem>;
   review_meta_by_id?: Record<string, ReviewClipMeta>;
+  suppressed_fp_items?: SuppressedFpItem[];
 }

@@ -18,6 +18,7 @@ import {
   ReviewOverviewBarSize,
   ReviewOverviewResponse,
   ReviewOverviewSeverity,
+  SuppressedFpItem,
   TrustCategoryFilter,
   TrustOverviewBucket,
 } from "@/types/reviewTrust";
@@ -206,6 +207,7 @@ type ReviewTrustOverviewProps = {
   onReviewMetaMapChange?: (
     reviewMetaById: Record<string, ReviewClipMeta>,
   ) => void;
+  onSuppressedFpItemsChange?: (items: SuppressedFpItem[]) => void;
   onUnreviewedFnCountChange?: (count: number) => void;
 };
 
@@ -223,6 +225,7 @@ export default function ReviewTrustOverview({
   onGoldenReviewIdsChange,
   onFeedbackMapChange,
   onReviewMetaMapChange,
+  onSuppressedFpItemsChange,
   onUnreviewedFnCountChange,
 }: ReviewTrustOverviewProps) {
   const [barSize, setBarSize] = useState<ReviewOverviewBarSize>("1h");
@@ -305,6 +308,12 @@ export default function ReviewTrustOverview({
       onReviewMetaMapChange(data.review_meta_by_id);
     }
   }, [data?.review_meta_by_id, onReviewMetaMapChange]);
+
+  useEffect(() => {
+    if (onSuppressedFpItemsChange) {
+      onSuppressedFpItemsChange(data?.suppressed_fp_items ?? []);
+    }
+  }, [data?.suppressed_fp_items, onSuppressedFpItemsChange]);
 
   useEffect(() => {
     if (
@@ -1381,7 +1390,11 @@ export default function ReviewTrustOverview({
               <div className="mb-1 border-b border-border pb-1 font-semibold">
                 {formatBucketRange(hover.bucket)} ·{" "}
                 {isAlerts ? "Alert Timing" : "Detection Timing"} (
-                {hover.bucket.timing.count})
+                {hover.bucket.timing.segment_count != null &&
+                hover.bucket.timing.segment_count > hover.bucket.timing.count
+                  ? `${hover.bucket.timing.count} of ${hover.bucket.timing.segment_count}`
+                  : hover.bucket.timing.count}
+                )
               </div>
               <div className="space-y-0.5">
                 <div className="flex justify-between gap-4">

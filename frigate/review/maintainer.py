@@ -681,6 +681,12 @@ class ReviewSegmentMaintainer(threading.Thread):
                         )
                         self.active_review_segments[segment.camera] = new_segment
                         self._publish_segment_start(new_segment)
+                        self._record_alert_timing(
+                            new_segment,
+                            end_time,
+                            activity.categorized_objects["detections"],
+                            severity="detection",
+                        )
                         new_segment.last_detection_time = last_detection_time
             elif segment.severity == SeverityEnum.detection and frame_time > (
                 segment.last_detection_time

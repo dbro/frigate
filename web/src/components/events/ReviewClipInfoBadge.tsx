@@ -10,7 +10,7 @@ import {
   TrustCategoryFilter,
 } from "@/types/reviewTrust";
 import { use24HourTime } from "@/hooks/use-date-utils";
-import { formatUnixTimestampToTimeWithCentiseconds } from "@/utils/dateUtil";
+import { formatUnixTimestampToDateTimeWithCentiseconds } from "@/utils/dateUtil";
 import {
   Tooltip,
   TooltipContent,
@@ -124,7 +124,7 @@ export default function ReviewClipInfoBadge({
 
   const startTimeText = useMemo(
     () =>
-      formatUnixTimestampToTimeWithCentiseconds(
+      formatUnixTimestampToDateTimeWithCentiseconds(
         review.start_time,
         is24Hour,
         config?.ui?.timezone,

@@ -558,3 +558,29 @@ export function formatUnixTimestampToTimeWithCentiseconds(
   const periodPart = formatInTimeZone(baseDate, tz, "a");
   return `${timePart}.${centis} ${periodPart}`;
 }
+
+/**
+ * Formats a Unix timestamp (seconds) as a date + time string with hundredths
+ * of a second, e.g. "Nov 27, 11:58:33.42 AM" or "Nov 27, 23:58:33.42".
+ */
+export function formatUnixTimestampToDateTimeWithCentiseconds(
+  unixTimestamp: number,
+  is24Hour: boolean,
+  timezone?: string,
+): string {
+  if (!Number.isFinite(unixTimestamp)) {
+    return "Invalid time";
+  }
+  const totalCentis = Math.round(unixTimestamp * 100);
+  const wholeSec = Math.floor(totalCentis / 100);
+  const centis = String(((totalCentis % 100) + 100) % 100).padStart(2, "0");
+  const tz = timezone || getResolvedTimeZone();
+  const baseDate = new Date(wholeSec * 1000);
+  const datePart = formatInTimeZone(baseDate, tz, "MMM d, yyyy");
+  if (is24Hour) {
+    return `${datePart}, ${formatInTimeZone(baseDate, tz, "HH:mm:ss")}.${centis}`;
+  }
+  const timePart = formatInTimeZone(baseDate, tz, "h:mm:ss");
+  const periodPart = formatInTimeZone(baseDate, tz, "a");
+  return `${datePart}, ${timePart}.${centis} ${periodPart}`;
+}

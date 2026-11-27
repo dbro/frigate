@@ -589,7 +589,13 @@ class TestReviewTrustAPI(unittest.TestCase):
         self.assertEqual(bar_d["above"]["auto_misclassified"], 1)
         self.assertEqual(bar_d["above"]["background_clips"], 1)
         self.assertEqual(bar_d["above"]["total"], 4)
+        self.assertEqual(bar_d["timing"]["segment_count"], 2)
         self.assertEqual(det_body["review_meta_by_id"]["det-2"]["category"], "auto_misclassified")
+        self.assertEqual(len(det_body["suppressed_fp_items"]), 1)
+        self.assertEqual(det_body["suppressed_fp_items"][0]["track_id"], "t-fp")
+        # Alerts view should not include suppressed_fp_items
+        self.assertEqual(alert_body["suppressed_fp_items"], [])
+        self.assertEqual(bar_a["timing"]["segment_count"], 4)
 
     def test_filters_and_golden_clip_endpoints(self) -> None:
         end_ts = 1_700_000_000.0
