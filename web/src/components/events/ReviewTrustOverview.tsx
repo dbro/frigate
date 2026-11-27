@@ -13,6 +13,7 @@ import { cn } from "@/lib/utils";
 import { ReviewFilter } from "@/types/review";
 import {
   GoldenClipSummary,
+  ReviewClipMeta,
   ReviewFeedbackItem,
   ReviewOverviewBarSize,
   ReviewOverviewResponse,
@@ -202,6 +203,9 @@ type ReviewTrustOverviewProps = {
   onFeedbackMapChange?: (
     feedbackByReviewId: Record<string, ReviewFeedbackItem>,
   ) => void;
+  onReviewMetaMapChange?: (
+    reviewMetaById: Record<string, ReviewClipMeta>,
+  ) => void;
   onUnreviewedFnCountChange?: (count: number) => void;
 };
 
@@ -218,6 +222,7 @@ export default function ReviewTrustOverview({
   onGoldenClipClick,
   onGoldenReviewIdsChange,
   onFeedbackMapChange,
+  onReviewMetaMapChange,
   onUnreviewedFnCountChange,
 }: ReviewTrustOverviewProps) {
   const [barSize, setBarSize] = useState<ReviewOverviewBarSize>("1h");
@@ -294,6 +299,12 @@ export default function ReviewTrustOverview({
       onFeedbackMapChange(data.feedback_by_review_id);
     }
   }, [data?.feedback_by_review_id, onFeedbackMapChange]);
+
+  useEffect(() => {
+    if (data?.review_meta_by_id && onReviewMetaMapChange) {
+      onReviewMetaMapChange(data.review_meta_by_id);
+    }
+  }, [data?.review_meta_by_id, onReviewMetaMapChange]);
 
   useEffect(() => {
     if (

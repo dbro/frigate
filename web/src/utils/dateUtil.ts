@@ -533,3 +533,28 @@ export function convertTo12Hour(time: string) {
   const hour12 = hour % 12 || 12;
   return `${hour12}:${minutes} ${ampm}`;
 }
+
+/**
+ * Formats a Unix timestamp (seconds) as a time string with hundredths of a
+ * second, e.g. "11:58:33.42 AM" (12-hour) or "23:58:33.42" (24-hour).
+ */
+export function formatUnixTimestampToTimeWithCentiseconds(
+  unixTimestamp: number,
+  is24Hour: boolean,
+  timezone?: string,
+): string {
+  if (!Number.isFinite(unixTimestamp)) {
+    return "Invalid time";
+  }
+  const totalCentis = Math.round(unixTimestamp * 100);
+  const wholeSec = Math.floor(totalCentis / 100);
+  const centis = String(((totalCentis % 100) + 100) % 100).padStart(2, "0");
+  const tz = timezone || getResolvedTimeZone();
+  const baseDate = new Date(wholeSec * 1000);
+  if (is24Hour) {
+    return `${formatInTimeZone(baseDate, tz, "HH:mm:ss")}.${centis}`;
+  }
+  const timePart = formatInTimeZone(baseDate, tz, "h:mm:ss");
+  const periodPart = formatInTimeZone(baseDate, tz, "a");
+  return `${timePart}.${centis} ${periodPart}`;
+}

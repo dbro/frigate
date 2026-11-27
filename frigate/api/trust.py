@@ -130,27 +130,61 @@ def _segment_score(
     return None
 
 
-def _fetch_event_scores(event_ids: set[str]) -> dict[str, float]:
+def _fetch_event_details(event_ids: set[str]) -> dict[str, dict[str, Any]]:
+    """Batch-fetch Event label/sub_label/score metadata for review segments."""
     if not event_ids:
         return {}
-    scores: dict[str, float] = {}
+    details: dict[str, dict[str, Any]] = {}
     id_list = sorted(event_ids)
     try:
         for i in range(0, len(id_list), 500):
             chunk = id_list[i : i + 500]
             for ev in Event.select(
-                Event.id, Event.top_score, Event.score, Event.data
+                Event.id,
+                Event.label,
+                Event.sub_label,
+                Event.top_score,
+                Event.score,
+                Event.start_time,
+                Event.end_time,
+                Event.data,
             ).where(Event.id << chunk):
-                val = ev.top_score
-                if val is None or val == 0:
-                    val = ev.score
-                if (val is None or val == 0) and isinstance(ev.data, dict):
-                    val = ev.data.get("top_score") or ev.data.get("score")
-                if val is not None:
-                    scores[ev.id] = float(val)
+                ev_data = ev.data if isinstance(ev.data, dict) else {}
+                top_score = ev.top_score
+                if (top_score is None or top_score == 0) and ev_data.get("top_score"):
+                    top_score = ev_data.get("top_score")
+                score = ev.score
+                if (score is None or score == 0) and ev_data.get("score"):
+                    score = ev_data.get("score")
+                effective_score = (
+                    float(top_score)
+                    if top_score is not None and float(top_score) > 0
+                    else (float(score) if score is not None else None)
+                )
+                details[ev.id] = {
+                    "id": ev.id,
+                    "label": ev.label,
+                    "sub_label": ev.sub_label,
+                    "score": round(float(score), 4) if score is not None else None,
+                    "top_score": (
+                        round(float(top_score), 4)
+                        if top_score is not None
+                        else None
+                    ),
+                    "effective_score": effective_score,
+                }
     except DatabaseError:
-        logger.debug("Event score lookup skipped or failed", exc_info=True)
-    return scores
+        logger.debug("Event details lookup skipped or failed", exc_info=True)
+    return details
+
+
+def _fetch_event_scores(event_ids: set[str]) -> dict[str, float]:
+    details = _fetch_event_details(event_ids)
+    return {
+        eid: float(info["effective_score"])
+        for eid, info in details.items()
+        if info.get("effective_score") is not None
+    }
 
 
 def _empty_bucket(
@@ -199,32 +233,31 @@ def _bucket_index(ts: float, window_start: float, bar_seconds: int) -> int | Non
     return None
 
 
-def _query_secondlook_bucket_counts(
+def _query_secondlook_analyses(
     sl_store: Any,
     *,
-    severity: str,
     window_start: float,
     window_end: float,
-    bar_seconds: int,
     cameras: list[str],
     label_filter: list[str] | None,
-    zone_filter: list[str] | None,
-) -> tuple[dict[int, dict[str, int]], dict[str, int]]:
-    """Aggregate Secondlook analyses / examples across the 30 buckets.
+) -> tuple[dict[str, dict[str, Any]], list[dict[str, Any]]]:
+    """Load Secondlook ``analyses`` rows for matching against ReviewSegments.
 
-    Returns ``(per_bucket_counts, summary_totals)``.
-    In ``alert`` view: counts ``rescued_fn`` (``live_outcome == 'fn_rescued'``)
-    and ``auto_misclassified`` (``live == 'misclass'``).
-    In ``detection`` view: counts ``auto_suppressed_fp`` (``live_outcome == 'fp_suppressed'``)
-    and ``auto_misclassified`` (``live == 'misclass'``).
+    Returns ``(by_event_id, suppressed_fp_rows)`` where:
+    - ``by_event_id`` maps ``event_id`` (padded +-1h around the window so tracks
+      ending slightly after a segment start still match) to Secondlook details.
+    - ``suppressed_fp_rows`` holds ``live_outcome == 'fp_suppressed'`` rows
+      strictly within ``[window_start, window_end)`` (these never create a
+      Frigate ReviewSegment and appear in the Detections chart above the line).
     """
-    per_bucket: dict[int, dict[str, int]] = {}
-    totals = {"rescued_fn": 0, "auto_suppressed_fp": 0, "auto_misclassified": 0}
+    by_event_id: dict[str, dict[str, Any]] = {}
+    suppressed_fp_rows: list[dict[str, Any]] = []
     if sl_store is None or not cameras:
-        return per_bucket, totals
+        return by_event_id, suppressed_fp_rows
 
+    pad = 3600.0
     clauses = ["end_time >= ?", "end_time < ?"]
-    params: list[Any] = [window_start, window_end]
+    params: list[Any] = [window_start - pad, window_end + pad]
     clauses.append(f"camera IN ({','.join('?' * len(cameras))})")
     params.extend(cameras)
 
@@ -233,8 +266,9 @@ def _query_secondlook_bucket_counts(
         params.extend(label_filter)
 
     sql = (
-        "SELECT end_time, live, live_outcome FROM analyses "
-        f"WHERE {' AND '.join(clauses)}"
+        "SELECT event_id, track_id, label, end_time, live, live_outcome, "
+        "misclass_label, primary_score, sl_score, factor "
+        f"FROM analyses WHERE {' AND '.join(clauses)}"
     )
 
     try:
@@ -248,29 +282,78 @@ def _query_secondlook_bucket_counts(
                 rows = []
     except sqlite3.Error:
         logger.debug("Secondlook analyses lookup failed", exc_info=True)
-        return per_bucket, totals
+        return by_event_id, suppressed_fp_rows
 
     for row in rows:
         end_ts = float(row["end_time"])
-        idx = _bucket_index(end_ts, window_start, bar_seconds)
-        if idx is None:
-            continue
         live = row["live"]
         live_outcome = row["live_outcome"]
-        counts = per_bucket.setdefault(
-            idx, {"rescued_fn": 0, "auto_suppressed_fp": 0, "auto_misclassified": 0}
-        )
-        if live == "misclass":
-            counts["auto_misclassified"] += 1
-            totals["auto_misclassified"] += 1
-        elif severity == "alert" and live_outcome == "fn_rescued":
-            counts["rescued_fn"] += 1
-            totals["rescued_fn"] += 1
-        elif severity == "detection" and live_outcome == "fp_suppressed":
-            counts["auto_suppressed_fp"] += 1
-            totals["auto_suppressed_fp"] += 1
+        event_id = row["event_id"]
+        info = {
+            "event_id": event_id,
+            "track_id": row["track_id"],
+            "label": row["label"],
+            "end_time": end_ts,
+            "live": live,
+            "live_outcome": live_outcome,
+            "misclass_label": row["misclass_label"],
+            "primary_score": (
+                round(float(row["primary_score"]), 4)
+                if row["primary_score"] is not None
+                else None
+            ),
+            "sl_score": (
+                round(float(row["sl_score"]), 4)
+                if row["sl_score"] is not None
+                else None
+            ),
+            "factor": (
+                round(float(row["factor"]), 3)
+                if row["factor"] is not None
+                else None
+            ),
+        }
+        if event_id:
+            by_event_id[str(event_id)] = info
+        if (
+            live_outcome == "fp_suppressed"
+            and window_start <= end_ts < window_end
+        ):
+            suppressed_fp_rows.append(info)
 
-    return per_bucket, totals
+    return by_event_id, suppressed_fp_rows
+
+
+def _normalize_timing_row(
+    row: dict[str, Any], severity: str
+) -> dict[str, Any] | None:
+    """Apply detection zero-confirmation and >30s outlier guard to a timing row."""
+    disc_ms = max(0.0, float(row["discovery_ms"]))
+    busy_ms = max(0.0, float(row["resource_busy_ms"]))
+    conf_ms = (
+        0.0
+        if severity == "detection"
+        else max(0.0, float(row["confirmation_ms"]))
+    )
+    total_ms = disc_ms + busy_ms + conf_ms
+    if total_ms > MAX_VALID_TIMING_MS:
+        return None
+    alert_time = float(row["alert_time"])
+    first_detected = float(
+        row.get("first_detected_time")
+        if row.get("first_detected_time") is not None
+        else max(0.0, alert_time - (conf_ms / 1000.0))
+    )
+    return {
+        "review_id": row["review_id"],
+        "severity": severity,
+        "alert_time": alert_time,
+        "first_detected_time": first_detected,
+        "discovery_ms": round(disc_ms, 2),
+        "resource_busy_ms": round(busy_ms, 2),
+        "confirmation_ms": round(conf_ms, 2),
+        "total_ms": round(total_ms, 2),
+    }
 
 
 @router.get(
@@ -332,6 +415,7 @@ async def get_review_overview(
                 "unreviewed_fn_count": 0,
                 "buckets": buckets,
                 "feedback_by_review_id": {},
+                "review_meta_by_id": {},
             }
         )
 
@@ -374,16 +458,19 @@ async def get_review_overview(
         except DatabaseError:
             reviewed_ids = set()
 
-    # Load event scores only when score filtering is requested
-    event_scores: dict[str, float] = {}
-    if min_score is not None or max_score is not None:
-        all_det_ids: set[str] = set()
-        for r in rows:
-            data = r.get("data") or {}
-            if data.get("score") is None:
-                for eid in data.get("detections") or []:
-                    all_det_ids.add(str(eid))
-        event_scores = _fetch_event_scores(all_det_ids)
+    # Batch-fetch Event details (labels, sub_labels, scores) for all segments
+    all_det_ids: set[str] = set()
+    for r in rows:
+        data = r.get("data") or {}
+        if isinstance(data, dict):
+            for eid in data.get("detections") or []:
+                all_det_ids.add(str(eid))
+    event_details = _fetch_event_details(all_det_ids)
+    event_scores = {
+        eid: float(info["effective_score"])
+        for eid, info in event_details.items()
+        if info.get("effective_score") is not None
+    }
 
     filtered_segments: list[dict[str, Any]] = []
     for r in rows:
@@ -425,40 +512,170 @@ async def get_review_overview(
         window_start, resolved_end, cameras=camera_list
     )
 
-    # Bucket filtered segments with strict no-double-counting:
-    # - verdict in ('fp', 'fn', 'misclassified') -> counted ONLY in below, NOT in above
-    # - verdict == 'good' -> counted in above (both above.good and above.total)
-    # - no verdict -> counted in above (above.tp and above.total)
+    # Secondlook analyses lookup by event_id so each ReviewSegment is classified
+    # into EXACTLY ONE category (never double-counted across alerts + rescued_fn
+    # / auto_misclassified).
+    sl_by_event_id, suppressed_fp_rows = _query_secondlook_analyses(
+        sl_store,
+        window_start=window_start,
+        window_end=resolved_end,
+        cameras=camera_list,
+        label_filter=label_filter,
+    )
+
+    # Per-review timing lookup for thumbnail info badges
+    seg_timings_raw = trust_store.get_timings_for_ids(
+        [seg["id"] for seg in filtered_segments]
+    )
+
+    # Bucket filtered segments with strict 1-to-1 classification (no double counting):
+    # 1. Human verdict in ('fp', 'fn', 'misclassified') -> counted ONLY below
+    # 2. Secondlook live == 'misclass' on a segment track -> above.auto_misclassified
+    # 3. Secondlook live_outcome == 'fn_rescued' (alert view) -> above.rescued_fn
+    # 4. Otherwise -> above.alerts (alert view) or above.detections (detection view)
     feedback_by_review_id: dict[str, dict[str, Any]] = {}
+    review_meta_by_id: dict[str, dict[str, Any]] = {}
+    above_key = "alerts" if severity == "alert" else "detections"
+
     for seg in filtered_segments:
         seg_id = seg["id"]
         start_ts = float(seg["start_time"])
+        end_ts = float(seg["end_time"]) if seg.get("end_time") is not None else None
         idx = _bucket_index(start_ts, window_start, bar_seconds)
         if idx is None:
             continue
         bucket = buckets[idx]
+        data = seg.get("data") if isinstance(seg.get("data"), dict) else {}
+        det_ids = [str(eid) for eid in (data.get("detections") or [])]
+
+        # Find highest-priority Secondlook match among this segment's tracks
+        sl_match: dict[str, Any] | None = None
+        for eid in det_ids:
+            cand = sl_by_event_id.get(eid)
+            if cand is None:
+                continue
+            if cand["live"] == "misclass":
+                sl_match = cand
+                break
+            if cand["live_outcome"] == "fn_rescued" and sl_match is None:
+                sl_match = cand
+            elif sl_match is None:
+                sl_match = cand
+
         fb = feedback_map.get(seg_id)
-        above_key = "alerts" if severity == "alert" else "detections"
+        is_good = False
+        category = above_key
+
         if fb is not None:
             feedback_by_review_id[seg_id] = fb
             verdict = fb["verdict"]
             if verdict in ("fp", "fn", "misclassified"):
                 bucket["below"][verdict] += 1
                 bucket["below"]["total"] += 1
-                continue
-            if verdict == "good":
-                bucket["above"]["good"] += 1
+                category = (
+                    "human_misclassified" if verdict == "misclassified" else verdict
+                )
+            else:
+                is_good = verdict == "good"
+                if sl_match is not None and sl_match["live"] == "misclass":
+                    bucket["above"]["auto_misclassified"] += 1
+                    bucket["above"]["total"] += 1
+                    category = "auto_misclassified"
+                elif (
+                    severity == "alert"
+                    and sl_match is not None
+                    and sl_match["live_outcome"] == "fn_rescued"
+                ):
+                    bucket["above"]["rescued_fn"] += 1
+                    bucket["above"]["total"] += 1
+                    category = "rescued_fn"
+                else:
+                    bucket["above"]["good"] += 1
+                    bucket["above"][above_key] += 1
+                    bucket["above"]["total"] += 1
+                    category = above_key
+        else:
+            if sl_match is not None and sl_match["live"] == "misclass":
+                bucket["above"]["auto_misclassified"] += 1
+                bucket["above"]["total"] += 1
+                category = "auto_misclassified"
+            elif (
+                severity == "alert"
+                and sl_match is not None
+                and sl_match["live_outcome"] == "fn_rescued"
+            ):
+                bucket["above"]["rescued_fn"] += 1
+                bucket["above"]["total"] += 1
+                category = "rescued_fn"
+            else:
+                bucket["above"]["tp"] += 1
                 bucket["above"][above_key] += 1
                 bucket["above"]["total"] += 1
-                continue
+                category = above_key
 
-        bucket["above"]["tp"] += 1
-        bucket["above"][above_key] += 1
-        bucket["above"]["total"] += 1
+        # Build enriched object list with scores from Event table (falling back to segment data)
+        clip_objects: list[dict[str, Any]] = []
+        for eid in det_ids:
+            ev_info = event_details.get(eid)
+            if ev_info is not None:
+                clip_objects.append(
+                    {
+                        "id": eid,
+                        "label": ev_info["label"],
+                        "sub_label": ev_info["sub_label"],
+                        "score": ev_info["score"],
+                        "top_score": ev_info["top_score"],
+                    }
+                )
+        if not clip_objects:
+            for obj_lbl in data.get("objects") or []:
+                clip_objects.append(
+                    {
+                        "id": None,
+                        "label": str(obj_lbl).removesuffix("-verified"),
+                        "sub_label": None,
+                        "score": None,
+                        "top_score": None,
+                    }
+                )
 
-    # Include any human-flagged FN feedback in this window that was NOT already
-    # matched to a ReviewSegment in this severity/query (for instance, an FN
-    # logged on a detection segment or an independent FN marker).
+        raw_timing = seg_timings_raw.get(seg_id)
+        norm_timing = (
+            _normalize_timing_row(raw_timing, severity)
+            if raw_timing is not None
+            else None
+        )
+
+        review_meta_by_id[seg_id] = {
+            "category": category,
+            "is_good": is_good,
+            "duration_sec": (
+                round(max(0.0, end_ts - start_ts), 2) if end_ts is not None else None
+            ),
+            "zones": [str(z) for z in (data.get("zones") or [])],
+            "objects": clip_objects,
+            "timing": norm_timing,
+            "secondlook": (
+                {
+                    "live": sl_match["live"],
+                    "live_outcome": sl_match["live_outcome"],
+                    "label": sl_match["label"],
+                    "misclass_label": sl_match["misclass_label"],
+                    "primary_score": sl_match["primary_score"],
+                    "sl_score": sl_match["sl_score"],
+                    "factor": sl_match["factor"],
+                }
+                if sl_match is not None
+                and (
+                    sl_match["live"] == "misclass"
+                    or sl_match["live_outcome"] == "fn_rescued"
+                )
+                else None
+            ),
+        }
+
+    # Include any human-flagged feedback in this window that was NOT already
+    # matched to a ReviewSegment in this severity/query.
     seen_ids = {seg["id"] for seg in filtered_segments}
     for rev_id, fb in feedback_map.items():
         if rev_id in seen_ids:
@@ -474,27 +691,16 @@ async def get_review_overview(
             buckets[idx]["below"][verdict] += 1
             buckets[idx]["below"]["total"] += 1
 
-    # Secondlook automatic metrics above the line
-    sl_per_bucket, _ = _query_secondlook_bucket_counts(
-        sl_store,
-        severity=severity,
-        window_start=window_start,
-        window_end=resolved_end,
-        bar_seconds=bar_seconds,
-        cameras=camera_list,
-        label_filter=label_filter,
-        zone_filter=zone_filter,
-    )
-    for idx, sl_counts in sl_per_bucket.items():
-        above = buckets[idx]["above"]
-        above["rescued_fn"] += sl_counts["rescued_fn"]
-        above["auto_suppressed_fp"] += sl_counts["auto_suppressed_fp"]
-        above["auto_misclassified"] += sl_counts["auto_misclassified"]
-        above["total"] += (
-            sl_counts["rescued_fn"]
-            + sl_counts["auto_suppressed_fp"]
-            + sl_counts["auto_misclassified"]
-        )
+    # Detections view only: stack Secondlook auto-suppressed FPs above the line.
+    # Suppressed FPs never generate a Frigate ReviewSegment (event_id is NULL)
+    # and live in the Corrections tab.
+    if severity == "detection":
+        for sl_row in suppressed_fp_rows:
+            idx = _bucket_index(sl_row["end_time"], window_start, bar_seconds)
+            if idx is None:
+                continue
+            buckets[idx]["above"]["auto_suppressed_fp"] += 1
+            buckets[idx]["above"]["total"] += 1
 
     # Golden clips inside window (per-bucket list + background_clips in detection view)
     golden_in_window = trust_store.list_golden_clips(
@@ -520,23 +726,12 @@ async def get_review_overview(
     )
     timings_by_bucket: dict[int, list[dict[str, Any]]] = {}
     for row in timings:
-        disc_ms = max(0.0, float(row["discovery_ms"]))
-        busy_ms = max(0.0, float(row["resource_busy_ms"]))
-        conf_ms = 0.0 if severity == "detection" else max(0.0, float(row["confirmation_ms"]))
-        total_ms = disc_ms + busy_ms + conf_ms
-        if total_ms > MAX_VALID_TIMING_MS:
+        norm = _normalize_timing_row(row, severity)
+        if norm is None:
             continue
-        idx = _bucket_index(float(row["alert_time"]), window_start, bar_seconds)
+        idx = _bucket_index(norm["alert_time"], window_start, bar_seconds)
         if idx is not None:
-            timings_by_bucket.setdefault(idx, []).append(
-                {
-                    "review_id": row["review_id"],
-                    "discovery_ms": disc_ms,
-                    "resource_busy_ms": busy_ms,
-                    "confirmation_ms": conf_ms,
-                    "total_ms": total_ms,
-                }
-            )
+            timings_by_bucket.setdefault(idx, []).append(norm)
 
     for idx, rows_in_bucket in timings_by_bucket.items():
         n = len(rows_in_bucket)
@@ -576,6 +771,53 @@ async def get_review_overview(
             "unreviewed_fn_count": unreviewed_fn_count,
             "buckets": buckets,
             "feedback_by_review_id": feedback_by_review_id,
+            "review_meta_by_id": review_meta_by_id,
+        }
+    )
+
+
+@router.get(
+    "/review/{review_id}/timing",
+    dependencies=[Depends(allow_any_authenticated())],
+)
+async def get_review_timing(
+    request: Request,
+    review_id: str,
+):
+    """Return Alert/Detection Timing breakdown for a single review segment."""
+    try:
+        segment = ReviewSegment.get(ReviewSegment.id == review_id)
+    except DoesNotExist:
+        return JSONResponse(
+            content={"success": False, "message": f"Review {review_id} not found"},
+            status_code=404,
+        )
+
+    await require_camera_access(segment.camera, request=request)
+    trust_store = _get_or_init_trust_store(request)
+    sev = "detection" if str(segment.severity) == "detection" else "alert"
+    raw = trust_store.get_timing_for_review(review_id)
+    norm = _normalize_timing_row(raw, sev) if raw is not None else None
+    if norm is None:
+        return JSONResponse(
+            content={
+                "review_id": review_id,
+                "camera": segment.camera,
+                "severity": sev,
+                "available": False,
+                "alert_time": float(segment.start_time),
+                "first_detected_time": float(segment.start_time),
+                "discovery_ms": 0.0,
+                "resource_busy_ms": 0.0,
+                "confirmation_ms": 0.0,
+                "total_ms": 0.0,
+            }
+        )
+    return JSONResponse(
+        content={
+            **norm,
+            "camera": segment.camera,
+            "available": True,
         }
     )
 

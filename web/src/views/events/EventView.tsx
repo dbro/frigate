@@ -103,8 +103,10 @@ import MotionPreviewsPane from "./MotionPreviewsPane";
 import CorrectionsView from "./CorrectionsView";
 import ReviewTrustOverview from "@/components/events/ReviewTrustOverview";
 import ReviewFeedbackBar from "@/components/events/ReviewFeedbackBar";
+import ReviewClipInfoBadge from "@/components/events/ReviewClipInfoBadge";
 import {
   GoldenClipSummary,
+  ReviewClipMeta,
   ReviewFeedbackItem,
   TrustCategoryFilter,
 } from "@/types/reviewTrust";
@@ -721,6 +723,9 @@ function DetectionReview({
   const [feedbackByReviewId, setFeedbackByReviewId] = useState<
     Record<string, ReviewFeedbackItem>
   >({});
+  const [reviewMetaById, setReviewMetaById] = useState<
+    Record<string, ReviewClipMeta>
+  >({});
   const [activeTrustCategory, setActiveTrustCategory] =
     useState<TrustCategoryFilter | null>(null);
   const [goldenReviewIds, setGoldenReviewIds] = useState<Set<string>>(
@@ -736,30 +741,30 @@ function DetectionReview({
     if (!currentItems || activeTrustCategory === null) {
       return currentItems;
     }
+    const resolveCategory = (item: ReviewSegment): TrustCategoryFilter => {
+      const fb = feedbackByReviewId[item.id];
+      if (fb?.verdict === "fp") return "fp";
+      if (fb?.verdict === "fn") return "fn";
+      if (fb?.verdict === "misclassified") return "human_misclassified";
+      const metaCat = reviewMetaById[item.id]?.category;
+      if (metaCat) return metaCat;
+      return item.severity === "detection" ? "detections" : "alerts";
+    };
+
     switch (activeTrustCategory) {
       case "alerts":
       case "detections":
-        return currentItems.filter((item) => {
-          const fb = feedbackByReviewId[item.id];
-          return !fb || fb.verdict === "good";
-        });
+      case "rescued_fn":
+      case "auto_misclassified":
       case "fp":
-        return currentItems.filter(
-          (item) => feedbackByReviewId[item.id]?.verdict === "fp",
-        );
       case "fn":
-        return currentItems.filter(
-          (item) => feedbackByReviewId[item.id]?.verdict === "fn",
-        );
       case "human_misclassified":
         return currentItems.filter(
-          (item) => feedbackByReviewId[item.id]?.verdict === "misclassified",
+          (item) => resolveCategory(item) === activeTrustCategory,
         );
       case "golden":
         return currentItems.filter((item) => goldenReviewIds.has(item.id));
-      case "rescued_fn":
       case "auto_suppressed_fp":
-      case "auto_misclassified":
       case "background_clips":
         return [];
     }
@@ -767,6 +772,7 @@ function DetectionReview({
     currentItems,
     activeTrustCategory,
     feedbackByReviewId,
+    reviewMetaById,
     goldenReviewIds,
   ]);
 
@@ -1089,6 +1095,7 @@ function DetectionReview({
             onGoldenClipClick={handleGoldenClipClick}
             onGoldenReviewIdsChange={setGoldenReviewIds}
             onFeedbackMapChange={setFeedbackByReviewId}
+            onReviewMetaMapChange={setReviewMetaById}
             onUnreviewedFnCountChange={onUnreviewedFnCountChange}
           />
         )}
@@ -1099,11 +1106,10 @@ function DetectionReview({
               <span className="font-semibold text-foreground">
                 Filtered by: {TRUST_CATEGORY_LABELS[activeTrustCategory]}
               </span>
-              {activeTrustCategory === "auto_suppressed_fp" ||
-              activeTrustCategory === "rescued_fn" ||
-              activeTrustCategory === "auto_misclassified" ? (
+              {activeTrustCategory === "auto_suppressed_fp" ? (
                 <span className="text-muted-foreground">
-                  Secondlook automatic items are stored in the Corrections tab.
+                  Auto-suppressed FPs did not generate Frigate clips and are
+                  stored in the Corrections tab.
                 </span>
               ) : activeTrustCategory === "background_clips" ? (
                 <span className="text-muted-foreground">
@@ -1195,8 +1201,6 @@ function DetectionReview({
           displayedItems?.length === 0 &&
           activeTrustCategory !== null &&
           activeTrustCategory !== "auto_suppressed_fp" &&
-          activeTrustCategory !== "rescued_fn" &&
-          activeTrustCategory !== "auto_misclassified" &&
           activeTrustCategory !== "background_clips" && (
             <div className="mx-auto py-8 text-center text-sm text-muted-foreground">
               No items in this view match{" "}
@@ -1226,7 +1230,7 @@ function DetectionReview({
                     }
                     className="review-item relative flex flex-col overflow-hidden rounded-lg border border-border/60 bg-card"
                   >
-                    <div className="aspect-video overflow-hidden">
+                    <div className="relative aspect-video overflow-hidden">
                       <PreviewThumbnailPlayer
                         review={value}
                         allPreviews={relevantPreviews}
@@ -1241,6 +1245,12 @@ function DetectionReview({
                         ) => {
                           onSelectReview(review, ctrl, detail);
                         }}
+                      />
+                      <ReviewClipInfoBadge
+                        review={value}
+                        meta={reviewMetaById[value.id]}
+                        feedback={feedbackByReviewId[value.id]}
+                        isGolden={goldenReviewIds.has(value.id)}
                       />
                     </div>
                     <ReviewFeedbackBar

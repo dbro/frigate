@@ -243,21 +243,40 @@ class TestReviewTrustAPI(unittest.TestCase):
         self,
         *,
         track_id: str,
+        event_id: str | None = None,
         camera: str = "front_door",
         label: str = "person",
         end_time: float,
         live: str,
         live_outcome: str | None = None,
+        misclass_label: str | None = None,
+        primary_score: float | None = None,
+        sl_score: float | None = None,
+        factor: float | None = None,
     ) -> None:
         with self.sl_store._connect() as conn:
             conn.execute(
                 """
                 INSERT INTO analyses (
-                    camera, track_id, label, end_time, outcome, live,
-                    live_outcome, written_at
-                ) VALUES (?, ?, ?, ?, 'result', ?, ?, ?)
+                    camera, track_id, event_id, label, end_time, outcome, live,
+                    live_outcome, misclass_label, primary_score, sl_score, factor,
+                    written_at
+                ) VALUES (?, ?, ?, ?, ?, 'result', ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (camera, track_id, label, end_time, live, live_outcome, end_time),
+                (
+                    camera,
+                    track_id,
+                    event_id,
+                    label,
+                    end_time,
+                    live,
+                    live_outcome,
+                    misclass_label,
+                    primary_score,
+                    sl_score,
+                    factor,
+                    end_time,
+                ),
             )
             conn.commit()
 
@@ -364,7 +383,11 @@ class TestReviewTrustAPI(unittest.TestCase):
         end_ts = 1_700_000_000.0
         t = end_ts - 1200.0  # Bar 29 in 1h view
 
-        # 1 alert segment + 1 human misclassified alert segment
+        # 4 alert segments:
+        # - al-1: normal alert
+        # - al-2: human misclassified alert
+        # - al-3: rescued FN alert (matched via ev-al-3)
+        # - al-4: Secondlook auto-misclassified alert (matched via ev-al-4)
         self._insert_segment(
             "al-1",
             start_time=t,
@@ -381,6 +404,22 @@ class TestReviewTrustAPI(unittest.TestCase):
             zones=["driveway"],
             score=0.90,
         )
+        self._insert_segment(
+            "al-3",
+            start_time=t + 40,
+            severity="alert",
+            objects=["person"],
+            zones=["porch"],
+            score=0.72,
+        )
+        self._insert_segment(
+            "al-4",
+            start_time=t + 50,
+            severity="alert",
+            objects=["dog"],
+            zones=["yard"],
+            score=0.78,
+        )
         self.trust_store.set_feedback(
             review_id="al-2",
             camera="front_door",
@@ -390,7 +429,7 @@ class TestReviewTrustAPI(unittest.TestCase):
             corrected_label="truck",
         )
 
-        # 1 detection segment
+        # 2 detection segments (det-1 normal, det-2 auto-misclassified via ev-det-2)
         self._insert_segment(
             "det-1",
             start_time=t + 60,
@@ -399,23 +438,63 @@ class TestReviewTrustAPI(unittest.TestCase):
             zones=["yard"],
             score=0.65,
         )
+        self._insert_segment(
+            "det-2",
+            start_time=t + 70,
+            severity="detection",
+            objects=["cat"],
+            zones=["yard"],
+            score=0.60,
+        )
 
-        # Secondlook automatic metrics in same bucket:
-        # rescued_fn (alerts view), fp_suppressed (detections view), misclass (both views)
+        # Secondlook analyses:
+        # - ev-al-3 rescued FN -> reclassifies al-3 (NO double counting!)
+        # - ev-al-4 misclass -> reclassifies al-4 (NO double counting!)
+        # - t-fp suppressed FP (event_id=None) -> Detections above.auto_suppressed_fp
+        # - t-unlinked-mc suppressed misclass (event_id=None) -> must NOT inflate Alerts bar!
+        # - ev-det-2 misclass -> reclassifies det-2 in Detections view
         self._insert_sl_analysis(
-            track_id="t-fn",
-            end_time=t + 10,
+            track_id="ev-al-3",
+            event_id="ev-al-3",
+            end_time=t + 45,
             live="false_negative",
             live_outcome="fn_rescued",
+            primary_score=0.45,
+            sl_score=0.82,
+            factor=1.5,
+        )
+        self._insert_sl_analysis(
+            track_id="ev-al-4",
+            event_id="ev-al-4",
+            label="dog",
+            end_time=t + 55,
+            live="misclass",
+            live_outcome=None,
+            misclass_label="cat",
         )
         self._insert_sl_analysis(
             track_id="t-fp",
+            event_id=None,
             end_time=t + 20,
             live="false_positive",
             live_outcome="fp_suppressed",
         )
         self._insert_sl_analysis(
-            track_id="t-mc", end_time=t + 30, live="misclass", live_outcome=None
+            track_id="t-unlinked-mc",
+            event_id=None,
+            end_time=t + 25,
+            live="misclass",
+            live_outcome=None,
+            misclass_label="bird",
+        )
+        self._insert_sl_analysis(
+            track_id="ev-det-2",
+            event_id="ev-det-2",
+            label="cat",
+            end_time=t + 75,
+            live="misclass",
+            live_outcome=None,
+            misclass_label="dog",
         )
 
         # Hollow background clip (counted above in detections view) + golden alert clip
@@ -441,6 +520,7 @@ class TestReviewTrustAPI(unittest.TestCase):
             review_id="al-1",
             camera="front_door",
             alert_time=t,
+            first_detected_time=t - 0.1,
             discovery_ms=0.0,
             resource_busy_ms=10.0,
             confirmation_ms=100.0,
@@ -449,12 +529,13 @@ class TestReviewTrustAPI(unittest.TestCase):
             review_id="al-2",
             camera="front_door",
             alert_time=t + 30,
+            first_detected_time=t + 29.7,
             discovery_ms=0.0,
             resource_busy_ms=30.0,
             confirmation_ms=300.0,
         )
 
-        # Alerts view
+        # Alerts view: total bar count == 4 (1 normal + 1 rescued_fn + 1 auto_misclass above, 1 human misclass below)
         alert_resp = self.client.get(
             "/review/overview", params={"severity": "alert", "end_time": end_ts}
         )
@@ -462,7 +543,7 @@ class TestReviewTrustAPI(unittest.TestCase):
         alert_body = alert_resp.json()
         self.assertEqual(alert_body["golden_total"], 2)
         bar_a = alert_body["buckets"][29]
-        self.assertEqual(bar_a["above"]["tp"], 1)
+        self.assertEqual(bar_a["above"]["alerts"], 1)
         self.assertEqual(bar_a["above"]["rescued_fn"], 1)
         self.assertEqual(bar_a["above"]["auto_suppressed_fp"], 0)
         self.assertEqual(bar_a["above"]["auto_misclassified"], 1)
@@ -478,18 +559,37 @@ class TestReviewTrustAPI(unittest.TestCase):
         self.assertAlmostEqual(bar_a["timing"]["slowest_ms"], 330.0)
         self.assertEqual(bar_a["timing"]["slowest_review_id"], "al-2")
 
-        # Detections view
+        # Per-clip metadata matches chart categories 1-to-1
+        meta_a = alert_body["review_meta_by_id"]
+        self.assertEqual(meta_a["al-1"]["category"], "alerts")
+        self.assertEqual(meta_a["al-2"]["category"], "human_misclassified")
+        self.assertEqual(meta_a["al-3"]["category"], "rescued_fn")
+        self.assertEqual(meta_a["al-4"]["category"], "auto_misclassified")
+        self.assertEqual(meta_a["al-4"]["secondlook"]["misclass_label"], "cat")
+        self.assertAlmostEqual(meta_a["al-1"]["timing"]["confirmation_ms"], 100.0)
+
+        # Single-review timing endpoint for DetailStream sidebar
+        t_resp = self.client.get("/review/al-1/timing")
+        self.assertEqual(t_resp.status_code, 200)
+        t_body = t_resp.json()
+        self.assertTrue(t_body["available"])
+        self.assertAlmostEqual(t_body["confirmation_ms"], 100.0)
+        self.assertAlmostEqual(t_body["first_detected_time"], t - 0.1, places=3)
+
+        # Detections view: 1 normal det + 1 auto_misclass det + 1 suppressed FP + 1 background clip
         det_resp = self.client.get(
             "/review/overview", params={"severity": "detection", "end_time": end_ts}
         )
         self.assertEqual(det_resp.status_code, 200)
-        bar_d = det_resp.json()["buckets"][29]
-        self.assertEqual(bar_d["above"]["tp"], 1)
+        det_body = det_resp.json()
+        bar_d = det_body["buckets"][29]
+        self.assertEqual(bar_d["above"]["detections"], 1)
         self.assertEqual(bar_d["above"]["rescued_fn"], 0)
         self.assertEqual(bar_d["above"]["auto_suppressed_fp"], 1)
         self.assertEqual(bar_d["above"]["auto_misclassified"], 1)
         self.assertEqual(bar_d["above"]["background_clips"], 1)
         self.assertEqual(bar_d["above"]["total"], 4)
+        self.assertEqual(det_body["review_meta_by_id"]["det-2"]["category"], "auto_misclassified")
 
     def test_filters_and_golden_clip_endpoints(self) -> None:
         end_ts = 1_700_000_000.0

@@ -101,6 +101,50 @@ export interface TrustOverviewBucket {
   timing: TrustOverviewBucketTiming;
 }
 
+export interface ReviewClipObjectInfo {
+  id: string | null;
+  label: string;
+  sub_label?: string | null;
+  score?: number | null;
+  top_score?: number | null;
+}
+
+export interface ReviewClipTiming {
+  review_id: string;
+  severity: ReviewOverviewSeverity;
+  alert_time: number;
+  first_detected_time: number;
+  discovery_ms: number;
+  resource_busy_ms: number;
+  confirmation_ms: number;
+  total_ms: number;
+}
+
+export interface ReviewTimingDetailResponse extends ReviewClipTiming {
+  camera: string;
+  available: boolean;
+}
+
+export interface ReviewClipSecondlookInfo {
+  live: string;
+  live_outcome?: string | null;
+  label: string;
+  misclass_label?: string | null;
+  primary_score?: number | null;
+  sl_score?: number | null;
+  factor?: number | null;
+}
+
+export interface ReviewClipMeta {
+  category: TrustCategoryFilter;
+  is_good: boolean;
+  duration_sec?: number | null;
+  zones: string[];
+  objects: ReviewClipObjectInfo[];
+  timing?: ReviewClipTiming | null;
+  secondlook?: ReviewClipSecondlookInfo | null;
+}
+
 export interface ReviewOverviewResponse {
   severity: ReviewOverviewSeverity;
   bar_size: ReviewOverviewBarSize;
@@ -112,4 +156,5 @@ export interface ReviewOverviewResponse {
   unreviewed_fn_count: number;
   buckets: TrustOverviewBucket[];
   feedback_by_review_id: Record<string, ReviewFeedbackItem>;
+  review_meta_by_id?: Record<string, ReviewClipMeta>;
 }

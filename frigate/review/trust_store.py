@@ -65,6 +65,7 @@ CREATE TABLE IF NOT EXISTS alert_timings (
     camera TEXT NOT NULL,
     severity TEXT NOT NULL DEFAULT 'alert',
     alert_time REAL NOT NULL,
+    first_detected_time REAL,
     discovery_ms REAL NOT NULL DEFAULT 0.0,
     resource_busy_ms REAL NOT NULL DEFAULT 0.0,
     confirmation_ms REAL NOT NULL DEFAULT 0.0,
@@ -122,14 +123,23 @@ def _golden_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
 def _timing_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
     keys = row.keys()
     severity = row["severity"] if "severity" in keys else "alert"
+    alert_time = float(row["alert_time"])
+    conf_ms = float(row["confirmation_ms"])
+    raw_first = row["first_detected_time"] if "first_detected_time" in keys else None
+    first_detected_time = (
+        float(raw_first)
+        if raw_first is not None
+        else max(0.0, alert_time - (conf_ms / 1000.0))
+    )
     return {
         "review_id": row["review_id"],
         "camera": row["camera"],
         "severity": severity,
-        "alert_time": float(row["alert_time"]),
+        "alert_time": alert_time,
+        "first_detected_time": first_detected_time,
         "discovery_ms": float(row["discovery_ms"]),
         "resource_busy_ms": float(row["resource_busy_ms"]),
-        "confirmation_ms": float(row["confirmation_ms"]),
+        "confirmation_ms": conf_ms,
         "total_ms": float(row["total_ms"]),
     }
 
@@ -150,10 +160,18 @@ class ReviewTrustStore:
                 row["name"]
                 for row in conn.execute("PRAGMA table_info(alert_timings)").fetchall()
             }
+            migrated = False
             if "severity" not in cols:
                 conn.execute(
                     "ALTER TABLE alert_timings ADD COLUMN severity TEXT NOT NULL DEFAULT 'alert'"
                 )
+                migrated = True
+            if "first_detected_time" not in cols:
+                conn.execute(
+                    "ALTER TABLE alert_timings ADD COLUMN first_detected_time REAL"
+                )
+                migrated = True
+            if migrated:
                 conn.commit()
 
     def _connect(self) -> sqlite3.Connection:
@@ -298,6 +316,7 @@ class ReviewTrustStore:
         confirmation_ms: float = 0.0,
         total_ms: float | None = None,
         severity: str = "alert",
+        first_detected_time: float | None = None,
     ) -> dict[str, Any]:
         """Record latency breakdown for a newly created alert or detection segment."""
         sev = "detection" if severity == "detection" else "alert"
@@ -309,17 +328,23 @@ class ReviewTrustStore:
         )
         if sev == "detection":
             total = disc + busy
+        resolved_first = (
+            float(first_detected_time)
+            if first_detected_time is not None
+            else max(0.0, float(alert_time) - (conf / 1000.0))
+        )
         with self._lock, self._connect() as conn:
             conn.execute(
                 """
                     INSERT INTO alert_timings (
-                        review_id, camera, severity, alert_time, discovery_ms,
-                        resource_busy_ms, confirmation_ms, total_ms
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        review_id, camera, severity, alert_time, first_detected_time,
+                        discovery_ms, resource_busy_ms, confirmation_ms, total_ms
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(review_id) DO UPDATE SET
                         camera = excluded.camera,
                         severity = excluded.severity,
                         alert_time = excluded.alert_time,
+                        first_detected_time = excluded.first_detected_time,
                         discovery_ms = excluded.discovery_ms,
                         resource_busy_ms = excluded.resource_busy_ms,
                         confirmation_ms = excluded.confirmation_ms,
@@ -330,6 +355,7 @@ class ReviewTrustStore:
                     camera,
                     sev,
                     float(alert_time),
+                    resolved_first,
                     disc,
                     busy,
                     conf,
@@ -343,6 +369,31 @@ class ReviewTrustStore:
             ).fetchone()
         assert row is not None
         return _timing_row_to_dict(row)
+
+    def get_timing_for_review(self, review_id: str) -> dict[str, Any] | None:
+        """Fetch a single timing row by review_id, or None if not recorded."""
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM alert_timings WHERE review_id = ?",
+                (review_id,),
+            ).fetchone()
+        return _timing_row_to_dict(row) if row else None
+
+    def get_timings_for_ids(self, review_ids: list[str]) -> dict[str, dict[str, Any]]:
+        """Return {review_id: timing_dict} for the requested review IDs."""
+        if not review_ids:
+            return {}
+        out: dict[str, dict[str, Any]] = {}
+        with self._lock, self._connect() as conn:
+            for i in range(0, len(review_ids), 500):
+                chunk = review_ids[i : i + 500]
+                rows = conn.execute(
+                    f"SELECT * FROM alert_timings WHERE review_id IN ({','.join('?' * len(chunk))})",
+                    chunk,
+                ).fetchall()
+                for row in rows:
+                    out[row["review_id"]] = _timing_row_to_dict(row)
+        return out
 
     def get_timings_in_range(
         self,

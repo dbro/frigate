@@ -342,6 +342,7 @@ class ReviewSegmentMaintainer(threading.Thread):
 
         confirmation_ms = 0.0
         resource_busy_ms = 0.0
+        first_detected_time: float = float(alert_time)
         if alert_objects:
             resource_busy_ms = min(
                 MAX_VALID_TIMING_MS,
@@ -351,14 +352,14 @@ class ReviewSegmentMaintainer(threading.Thread):
                 ),
             )
             if severity == "alert":
-                candidate_confirmations: list[float] = []
+                candidate_confirmations: list[tuple[float, float]] = []
                 for o in alert_objects:
                     start_t = float(o.get("start_time", alert_time))
                     last_active_t = float(o.get("last_active_time") or start_t)
                     ref_start = max(start_t, last_active_t)
                     elapsed_ms = max(0.0, (float(alert_time) - ref_start) * 1000.0)
                     if elapsed_ms <= MAX_VALID_TIMING_MS:
-                        candidate_confirmations.append(elapsed_ms)
+                        candidate_confirmations.append((elapsed_ms, ref_start))
                         continue
                     confirmed_t = o.get("confirmed_time")
                     if confirmed_t is not None:
@@ -366,14 +367,18 @@ class ReviewSegmentMaintainer(threading.Thread):
                             0.0, (float(confirmed_t) - start_t) * 1000.0
                         )
                         if conf_elapsed <= MAX_VALID_TIMING_MS:
-                            candidate_confirmations.append(conf_elapsed)
+                            candidate_confirmations.append((conf_elapsed, start_t))
 
                 if not candidate_confirmations:
                     # All objects triggering this alert are long-lived tracks
                     # (>30s old) with no fresh confirmation window; skip so
                     # stationary/loitering track ages do not skew alert timing.
                     return
-                confirmation_ms = min(candidate_confirmations)
+                confirmation_ms, first_detected_time = min(
+                    candidate_confirmations, key=lambda pair: pair[0]
+                )
+            else:
+                first_detected_time = float(alert_time)
 
         # Placeholder for future Reverse Norfair pre-birth discovery latency
         discovery_ms = 0.0
@@ -382,6 +387,7 @@ class ReviewSegmentMaintainer(threading.Thread):
                 review_id=segment.id,
                 camera=segment.camera,
                 alert_time=float(alert_time),
+                first_detected_time=first_detected_time,
                 discovery_ms=discovery_ms,
                 resource_busy_ms=resource_busy_ms,
                 confirmation_ms=confirmation_ms,

@@ -5,7 +5,7 @@ import { useDetailStream } from "@/context/detail-stream-context";
 import scrollIntoView from "scroll-into-view-if-needed";
 import useUserInteraction from "@/hooks/use-user-interaction";
 import {
-  formatUnixTimestampToDateTime,
+  formatUnixTimestampToTimeWithCentiseconds,
   getDurationFromTimestamps,
 } from "@/utils/dateUtil";
 import { use24HourTime } from "@/hooks/use-date-utils";
@@ -18,6 +18,7 @@ import { Event } from "@/types/event";
 import { EventType } from "@/types/search";
 import { getIconForLabel } from "@/utils/iconUtil";
 import { REVIEW_PADDING, ReviewSegment } from "@/types/review";
+import { ReviewTimingDetailResponse } from "@/types/reviewTrust";
 import { LuChevronDown, LuCircle, LuChevronRight } from "react-icons/lu";
 import { getTranslatedLabel } from "@/utils/i18n";
 import EventMenu from "@/components/timeline/EventMenu";
@@ -407,14 +408,11 @@ function ReviewGroup({
   }, [isActive, alwaysExpandActive]);
 
   const is24Hour = use24HourTime(config);
-  const displayTime = formatUnixTimestampToDateTime(start, {
-    timezone: config.ui.timezone,
-    date_format: is24Hour
-      ? t("time.formattedTimestampHourMinuteSecond.24hour", { ns: "common" })
-      : t("time.formattedTimestampHourMinuteSecond.12hour", { ns: "common" }),
-    time_style: "medium",
-    date_style: "medium",
-  });
+  const displayTime = formatUnixTimestampToTimeWithCentiseconds(
+    start,
+    is24Hour,
+    config.ui.timezone,
+  );
 
   const shouldFetchEvents = open && review?.data?.detections?.length > 0;
 
@@ -422,6 +420,15 @@ function ReviewGroup({
     shouldFetchEvents
       ? ["event_ids", { ids: review.data.detections.join(",") }]
       : null,
+  );
+
+  const shouldFetchTiming =
+    open &&
+    Boolean(review.id) &&
+    (review.severity === "alert" || review.severity === "detection");
+
+  const { data: timingData } = useSWR<ReviewTimingDetailResponse>(
+    shouldFetchTiming ? `review/${encodeURIComponent(review.id)}/timing` : null,
   );
 
   const rawIconLabels: Array<{ label: string; type: EventType }> = [
@@ -469,6 +476,8 @@ function ReviewGroup({
     [review.start_time, review.end_time],
   );
 
+  const isAlertReview = review.severity === "alert";
+
   return (
     <div
       data-review-id={id}
@@ -501,7 +510,7 @@ function ReviewGroup({
         <div className="mr-3 grid w-full grid-cols-[1fr_auto] gap-2">
           <div className="ml-1 flex min-w-0 flex-col gap-1.5">
             <div className="flex flex-row gap-3">
-              <div className="text-sm font-medium">{displayTime}</div>
+              <div className="font-mono text-sm font-medium">{displayTime}</div>
               <div className="relative flex items-center gap-2 text-white">
                 {iconLabels.slice(0, 5).map(({ label: lbl, type }, idx) => (
                   <div
@@ -570,6 +579,167 @@ function ReviewGroup({
 
       {open && (
         <div className="space-y-0.5">
+          {timingData &&
+            (review.severity === "alert" ||
+              review.severity === "detection") && (
+              <div
+                className="mx-2 my-2 rounded-md border border-border/70 bg-background/60 px-2.5 py-2 text-xs"
+                onClick={(e) => e.stopPropagation()}
+              >
+                <div className="mb-1.5 flex items-center justify-between gap-2">
+                  <span className="font-semibold text-foreground">
+                    {isAlertReview ? "Alert Timing" : "Detection Timing"}
+                  </span>
+                  {timingData.available ? (
+                    <span
+                      className={cn(
+                        "font-mono font-semibold",
+                        timingData.total_ms <= 2000
+                          ? "text-emerald-600 dark:text-emerald-400"
+                          : "text-amber-600 dark:text-amber-400",
+                      )}
+                    >
+                      {(timingData.total_ms / 1000).toFixed(2)}s total
+                    </span>
+                  ) : (
+                    <span className="text-[11px] text-muted-foreground">
+                      Not recorded
+                    </span>
+                  )}
+                </div>
+                {timingData.available &&
+                  (() => {
+                    const discSec = timingData.discovery_ms / 1000;
+                    const busySec = timingData.resource_busy_ms / 1000;
+                    const confSec = isAlertReview
+                      ? timingData.confirmation_ms / 1000
+                      : 0;
+                    const totalSec = Math.max(
+                      0.001,
+                      discSec + busySec + confSec,
+                    );
+                    const scaleMax = Math.max(2.0, totalSec);
+                    const firstDetectTs = timingData.first_detected_time;
+                    const discoveryStartTs = Math.max(
+                      0,
+                      firstDetectTs - discSec,
+                    );
+                    const alertTs = timingData.alert_time;
+                    const seekToDetectTime = (ts: number) => {
+                      onActivate?.();
+                      onSeek(ts + annotationOffset / 1000, false);
+                    };
+
+                    return (
+                      <div className="space-y-1.5">
+                        {/* Mini stacked timing bar vs 2.0s Goal */}
+                        <div className="relative flex h-2 w-full overflow-hidden rounded-full bg-muted">
+                          {discSec > 0 && (
+                            <div
+                              style={{
+                                width: `${(discSec / scaleMax) * 100}%`,
+                                backgroundColor: "#64748b",
+                              }}
+                            />
+                          )}
+                          {busySec > 0 && (
+                            <div
+                              style={{
+                                width: `${(busySec / scaleMax) * 100}%`,
+                                backgroundColor: "#f59e0b",
+                              }}
+                            />
+                          )}
+                          {isAlertReview && confSec > 0 && (
+                            <div
+                              style={{
+                                width: `${(confSec / scaleMax) * 100}%`,
+                                backgroundColor: "#8b5cf6",
+                              }}
+                            />
+                          )}
+                          <div
+                            title="2.0s Goal"
+                            className="pointer-events-none absolute bottom-0 top-0 w-0.5 bg-foreground/60"
+                            style={{ left: `${(2.0 / scaleMax) * 100}%` }}
+                          />
+                        </div>
+
+                        {/* Clickable timing points with hundredths of a second */}
+                        <div className="space-y-1 text-[11px]">
+                          <button
+                            type="button"
+                            onClick={() => seekToDetectTime(discoveryStartTs)}
+                            className="flex w-full items-center justify-between gap-2 rounded px-1 py-0.5 text-left transition hover:bg-muted/70"
+                            title="Seek to discovery point"
+                          >
+                            <span className="inline-flex items-center gap-1.5 text-muted-foreground">
+                              <span className="size-2 shrink-0 rounded-sm bg-slate-400" />
+                              Discovery
+                            </span>
+                            <span className="flex items-center gap-2 font-mono">
+                              <span>{discSec.toFixed(2)}s</span>
+                              <span className="text-muted-foreground">
+                                {formatUnixTimestampToTimeWithCentiseconds(
+                                  discoveryStartTs,
+                                  is24Hour,
+                                  config.ui.timezone,
+                                )}
+                              </span>
+                            </span>
+                          </button>
+
+                          <button
+                            type="button"
+                            onClick={() => seekToDetectTime(firstDetectTs)}
+                            className="flex w-full items-center justify-between gap-2 rounded px-1 py-0.5 text-left transition hover:bg-muted/70"
+                            title="Seek to first detected frame (detector queue wait)"
+                          >
+                            <span className="inline-flex items-center gap-1.5 text-amber-600 dark:text-amber-400">
+                              <span className="size-2 shrink-0 rounded-sm bg-amber-500" />
+                              Resource Busy
+                            </span>
+                            <span className="flex items-center gap-2 font-mono">
+                              <span>{busySec.toFixed(2)}s</span>
+                              <span className="text-muted-foreground">
+                                {formatUnixTimestampToTimeWithCentiseconds(
+                                  firstDetectTs,
+                                  is24Hour,
+                                  config.ui.timezone,
+                                )}
+                              </span>
+                            </span>
+                          </button>
+
+                          {isAlertReview && (
+                            <button
+                              type="button"
+                              onClick={() => seekToDetectTime(alertTs)}
+                              className="flex w-full items-center justify-between gap-2 rounded px-1 py-0.5 text-left transition hover:bg-muted/70"
+                              title="Seek to alert confirmation frame"
+                            >
+                              <span className="inline-flex items-center gap-1.5 text-violet-600 dark:text-violet-400">
+                                <span className="size-2 shrink-0 rounded-sm bg-violet-500" />
+                                Confirmation
+                              </span>
+                              <span className="flex items-center gap-2 font-mono">
+                                <span>{confSec.toFixed(2)}s</span>
+                                <span className="text-muted-foreground">
+                                  {formatUnixTimestampToTimeWithCentiseconds(
+                                    alertTs,
+                                    is24Hour,
+                                    config.ui.timezone,
+                                  )}
+                                </span>
+                              </span>
+                            </button>
+                          )}
+                        </div>
+                      </div>
+                    );
+                  })()}
+              </div>
+            )}
           {shouldFetchEvents && isValidating && !fetchedEvents ? (
             <ActivityIndicator />
           ) : (
@@ -798,18 +968,11 @@ function LifecycleItem({
 
   const is24Hour = use24HourTime(config);
   const formattedEventTimestamp = config
-    ? formatUnixTimestampToDateTime(item?.timestamp ?? 0, {
-        timezone: config.ui.timezone,
-        date_format: is24Hour
-          ? t("time.formattedTimestampHourMinuteSecond.24hour", {
-              ns: "common",
-            })
-          : t("time.formattedTimestampHourMinuteSecond.12hour", {
-              ns: "common",
-            }),
-        time_style: "medium",
-        date_style: "medium",
-      })
+    ? formatUnixTimestampToTimeWithCentiseconds(
+        item?.timestamp ?? 0,
+        is24Hour,
+        config.ui.timezone,
+      )
     : "";
 
   const ratio = useMemo(
