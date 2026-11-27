@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
-from collections import deque
+from collections import OrderedDict, deque
 from dataclasses import dataclass
 from typing import Any
 
@@ -14,8 +14,19 @@ import numpy as np
 from frigate.comms.event_metadata_updater import EventMetadataPublisher
 from frigate.config import FrigateConfig
 from frigate.config.classification import CameraSecondlookConfig
+from frigate.const import EXPORT_DIR
 from frigate.data_processing.real_time.api import DeferredRealtimeProcessorApi
 from frigate.data_processing.types import DataProcessorMetrics
+from frigate.review.reverse_norfair import (
+    CameraFrameRingBuffer,
+    run_reverse_norfair,
+)
+from frigate.review.trust_store import (
+    ReviewTrustStore,
+    default_trust_db_path,
+    get_review_trust_store,
+    init_review_trust_store,
+)
 from frigate.secondlook.factor import compute_factor
 from frigate.secondlook.evidence import source_evidence, finish_evidence
 from frigate.secondlook.match import box_iou, select_misclass
@@ -103,6 +114,179 @@ class SecondlookProcessor(DeferredRealtimeProcessorApi):
                 model_refusal=self.model.refusal,
             )
         self._pending_results = deque(maxlen=max(4, sl.queue_max * 2))
+        # Reverse Norfair state: low-memory per-camera frame ring + low-priority
+        # backward-tracking queue that always yields to live Secondlook tasks.
+        self._frame_ring = CameraFrameRingBuffer(
+            max_frames=30, min_interval=0.18, jpeg_quality=75
+        )
+        self._track_seeds: OrderedDict[str, dict[str, Any]] = OrderedDict()
+        self._seed_lock = threading.Lock()
+        self._reverse_queue: deque[dict[str, Any]] = deque(maxlen=8)
+        self._reverse_lock = threading.Lock()
+        self._reverse_scheduled: set[str] = set()
+        self._trust_store: ReviewTrustStore | None = None
+
+    def _get_trust_store(self) -> ReviewTrustStore | None:
+        if self._trust_store is not None:
+            return self._trust_store
+        existing = get_review_trust_store()
+        if existing is not None:
+            self._trust_store = existing
+            return existing
+        try:
+            db_path = default_trust_db_path(self.config.database.path)
+            self._trust_store = init_review_trust_store(db_path, EXPORT_DIR)
+            return self._trust_store
+        except Exception:
+            logger.debug(
+                "Failed to initialize ReviewTrustStore in SecondlookProcessor",
+                exc_info=True,
+            )
+            return None
+
+    def record_frame(
+        self, camera: str, frame_time: float, yuv_frame: np.ndarray
+    ) -> None:
+        """Buffer a camera frame for retrospective Reverse Norfair lookback."""
+        if not self.model.available or self.model.mock:
+            return
+        self._frame_ring.push_yuv(camera, frame_time, yuv_frame)
+
+    def record_track_seed(self, obj_data: dict[str, Any]) -> None:
+        """Remember the earliest forward detection box/time for a tracked object."""
+        object_id = obj_data.get("id")
+        camera = obj_data.get("camera")
+        label = obj_data.get("label")
+        box = obj_data.get("box")
+        if not object_id or not camera or not label or not box or len(box) < 4:
+            return
+        first_time = float(
+            obj_data.get("first_detect_time")
+            or obj_data.get("start_time")
+            or obj_data.get("frame_time")
+            or 0.0
+        )
+        first_box = obj_data.get("first_detect_box") or box
+        with self._seed_lock:
+            existing = self._track_seeds.get(str(object_id))
+            if existing is None:
+                self._track_seeds[str(object_id)] = {
+                    "camera": str(camera),
+                    "label": str(label),
+                    "first_detect_time": first_time,
+                    "first_detect_box": [int(v) for v in first_box[:4]],
+                    "later_box": [int(v) for v in box[:4]],
+                }
+                if len(self._track_seeds) > 250:
+                    self._track_seeds.popitem(last=False)
+            elif existing["later_box"] == existing["first_detect_box"]:
+                existing["later_box"] = [int(v) for v in box[:4]]
+
+    def schedule_reverse_norfair(
+        self,
+        review_id: str,
+        camera: str,
+        detection_ids: list[str],
+    ) -> bool:
+        """Enqueue a low-priority Reverse Norfair walk for a new review segment."""
+        if not self.model.available or self.model.mock or not detection_ids:
+            return False
+
+        best_seed: dict[str, Any] | None = None
+        with self._seed_lock:
+            for det_id in detection_ids:
+                seed = self._track_seeds.get(str(det_id))
+                if seed is None:
+                    continue
+                if (
+                    best_seed is None
+                    or seed["first_detect_time"] < best_seed["first_detect_time"]
+                ):
+                    best_seed = dict(seed)
+
+        if best_seed is None:
+            return False
+
+        frames_rev = self._frame_ring.snapshot_before(
+            camera,
+            best_seed["first_detect_time"],
+            lookback_sec=6.0,
+        )
+        if not frames_rev:
+            store = self._get_trust_store()
+            if store is not None:
+                store.update_discovery_timing(
+                    review_id,
+                    first_visible_time=best_seed["first_detect_time"],
+                    discovery_ms=0.0,
+                    status="done",
+                )
+            return False
+
+        job = {
+            "review_id": review_id,
+            "camera": camera,
+            "label": best_seed["label"],
+            "first_detect_time": best_seed["first_detect_time"],
+            "seed_box": best_seed["first_detect_box"],
+            "seed_box_later": best_seed.get("later_box"),
+            "frames_rev": frames_rev,
+            "retries": 0,
+        }
+        with self._reverse_lock:
+            if review_id in self._reverse_scheduled:
+                return False
+            self._reverse_scheduled.add(review_id)
+            if len(self._reverse_scheduled) > 500:
+                self._reverse_scheduled.clear()
+            self._reverse_queue.append(job)
+
+        if self._task_queue.empty():
+            super()._enqueue_task({"kind": "reverse_norfair_drain"})
+        return True
+
+    def _run_one_reverse_norfair(self) -> None:
+        """Pop and run at most one Reverse Norfair job if live queue is idle."""
+        if not self._task_queue.empty():
+            return
+        with self._reverse_lock:
+            if not self._reverse_queue:
+                return
+            job = self._reverse_queue.popleft()
+
+        result = run_reverse_norfair(
+            frames_rev=job["frames_rev"],
+            label=job["label"],
+            first_detect_time=job["first_detect_time"],
+            seed_box=job["seed_box"],
+            seed_box_later=job.get("seed_box_later"),
+            detector_fn=self.model.infer,
+            input_size=self.model.input_size,
+            context_scale=max(2.5, float(self.sl_config.context_scale)),
+            min_score=min(0.25, float(self.sl_config.model.min_score)),
+            should_preempt=lambda: not self._task_queue.empty(),
+        )
+        if result.preempted and job["retries"] < 2:
+            job["retries"] += 1
+            with self._reverse_lock:
+                self._reverse_queue.append(job)
+            return
+
+        store = self._get_trust_store()
+        if store is not None:
+            try:
+                store.update_discovery_timing(
+                    job["review_id"],
+                    first_visible_time=result.first_visible_time,
+                    discovery_ms=result.discovery_ms,
+                    status="done",
+                )
+            except Exception:
+                logger.debug(
+                    "Failed to persist Reverse Norfair result for %s",
+                    job["review_id"],
+                    exc_info=True,
+                )
 
     def _enqueue_task(self, task):
         task["enqueued_at"] = time.perf_counter()
@@ -380,6 +564,15 @@ class SecondlookProcessor(DeferredRealtimeProcessorApi):
         kind = task.get("kind")
         if kind == "expire":
             self._tracks.pop(task["object_id"], None)
+            self._run_one_reverse_norfair()
+            return
+        if kind == "reverse_norfair_drain":
+            while self._task_queue.empty():
+                with self._reverse_lock:
+                    has_more = bool(self._reverse_queue)
+                if not has_more:
+                    break
+                self._run_one_reverse_norfair()
             return
         if kind != "infer":
             return
@@ -389,6 +582,8 @@ class SecondlookProcessor(DeferredRealtimeProcessorApi):
             # an item leaves the Secondlook queue only once it was processed
             with self._items_lock:
                 self._change_queue_items(-1)
+        if self._task_queue.empty():
+            self._run_one_reverse_norfair()
 
     def _analyse(self, task: dict[str, Any]) -> None:
         started = time.perf_counter()
@@ -528,9 +723,12 @@ class SecondlookProcessor(DeferredRealtimeProcessorApi):
         return None
 
     def expire_object(self, object_id: str, camera: str) -> None:
+        state = self._tracks.pop(object_id, None)
+        if state is not None and state.factor is not None and state.factor < 0.85:
+            # Candidate Auto-Suppressed FP: schedule Reverse Norfair against the
+            # sl_<track_id> timing row written by finish_secondlook_track.
+            self.schedule_reverse_norfair(f"sl_{object_id}", camera, [object_id])
         self._enqueue_task({"kind": "expire", "object_id": object_id})
-        # also drop locally so we don't keep growing if queue is busy
-        self._tracks.pop(object_id, None)
 
     CONFIG_UPDATE_TOPIC = "config/secondlook"
 

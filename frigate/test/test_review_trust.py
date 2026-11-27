@@ -515,24 +515,46 @@ class TestReviewTrustAPI(unittest.TestCase):
             condition_tags=["day"],
         )
 
-        # Alert timing rows in bar 29
+        # Alert timing rows in bar 29 (pure consecutive timestamp differences)
         self.trust_store.record_alert_timing(
             review_id="al-1",
             camera="front_door",
             alert_time=t,
-            first_detected_time=t - 0.1,
-            discovery_ms=0.0,
-            resource_busy_ms=10.0,
+            first_visible_time=t - 0.35,
+            first_detected_time=t - 0.25,
+            track_start_time=t - 0.15,
+            confirmed_time=t - 0.05,
+            discovery_ms=100.0,
+            tracking_ms=100.0,
             confirmation_ms=100.0,
+            zone_delay_ms=50.0,
+            reverse_norfair_status="done",
         )
         self.trust_store.record_alert_timing(
             review_id="al-2",
             camera="front_door",
             alert_time=t + 30,
-            first_detected_time=t + 29.7,
-            discovery_ms=0.0,
-            resource_busy_ms=30.0,
+            first_visible_time=t + 29.4,
+            first_detected_time=t + 29.6,
+            track_start_time=t + 29.7,
+            confirmed_time=t + 30.0,
+            discovery_ms=200.0,
+            tracking_ms=100.0,
             confirmation_ms=300.0,
+            zone_delay_ms=0.0,
+            reverse_norfair_status="done",
+        )
+        # Suppressed FP timing row attached to t-fp in Detections view
+        self.trust_store.record_alert_timing(
+            review_id="sl_t-fp",
+            camera="front_door",
+            severity="suppressed_fp",
+            alert_time=t + 20,
+            discovery_ms=50.0,
+            tracking_ms=120.0,
+            confirmation_ms=480.0,
+            zone_delay_ms=0.0,
+            reverse_norfair_status="done",
         )
 
         # Alerts view: total bar count == 4 (1 normal + 1 rescued_fn + 1 auto_misclass above, 1 human misclass below)
@@ -552,11 +574,12 @@ class TestReviewTrustAPI(unittest.TestCase):
         self.assertEqual(bar_a["below"]["misclassified"], 1)
         self.assertEqual(bar_a["below"]["total"], 1)
         self.assertEqual(bar_a["timing"]["count"], 2)
-        self.assertAlmostEqual(bar_a["timing"]["avg_discovery_ms"], 0.0)
-        self.assertAlmostEqual(bar_a["timing"]["avg_resource_busy_ms"], 20.0)
+        self.assertAlmostEqual(bar_a["timing"]["avg_discovery_ms"], 150.0)
+        self.assertAlmostEqual(bar_a["timing"]["avg_tracking_ms"], 100.0)
         self.assertAlmostEqual(bar_a["timing"]["avg_confirmation_ms"], 200.0)
-        self.assertAlmostEqual(bar_a["timing"]["avg_total_ms"], 220.0)
-        self.assertAlmostEqual(bar_a["timing"]["slowest_ms"], 330.0)
+        self.assertAlmostEqual(bar_a["timing"]["avg_zone_delay_ms"], 25.0)
+        self.assertAlmostEqual(bar_a["timing"]["avg_total_ms"], 475.0)
+        self.assertAlmostEqual(bar_a["timing"]["slowest_ms"], 600.0)
         self.assertEqual(bar_a["timing"]["slowest_review_id"], "al-2")
 
         # Per-clip metadata matches chart categories 1-to-1
@@ -567,14 +590,20 @@ class TestReviewTrustAPI(unittest.TestCase):
         self.assertEqual(meta_a["al-4"]["category"], "auto_misclassified")
         self.assertEqual(meta_a["al-4"]["secondlook"]["misclass_label"], "cat")
         self.assertAlmostEqual(meta_a["al-1"]["timing"]["confirmation_ms"], 100.0)
+        self.assertAlmostEqual(meta_a["al-1"]["timing"]["tracking_ms"], 100.0)
+        self.assertAlmostEqual(meta_a["al-1"]["timing"]["zone_delay_ms"], 50.0)
 
         # Single-review timing endpoint for DetailStream sidebar
         t_resp = self.client.get("/review/al-1/timing")
         self.assertEqual(t_resp.status_code, 200)
         t_body = t_resp.json()
         self.assertTrue(t_body["available"])
+        self.assertAlmostEqual(t_body["discovery_ms"], 100.0)
+        self.assertAlmostEqual(t_body["tracking_ms"], 100.0)
         self.assertAlmostEqual(t_body["confirmation_ms"], 100.0)
-        self.assertAlmostEqual(t_body["first_detected_time"], t - 0.1, places=3)
+        self.assertAlmostEqual(t_body["zone_delay_ms"], 50.0)
+        self.assertAlmostEqual(t_body["total_ms"], 350.0)
+        self.assertAlmostEqual(t_body["first_detected_time"], t - 0.25, places=3)
 
         # Detections view: 1 normal det + 1 auto_misclass det + 1 suppressed FP + 1 background clip
         det_resp = self.client.get(
@@ -593,6 +622,10 @@ class TestReviewTrustAPI(unittest.TestCase):
         self.assertEqual(det_body["review_meta_by_id"]["det-2"]["category"], "auto_misclassified")
         self.assertEqual(len(det_body["suppressed_fp_items"]), 1)
         self.assertEqual(det_body["suppressed_fp_items"][0]["track_id"], "t-fp")
+        self.assertIsNotNone(det_body["suppressed_fp_items"][0]["timing"])
+        self.assertAlmostEqual(
+            det_body["suppressed_fp_items"][0]["timing"]["total_ms"], 650.0
+        )
         # Alerts view should not include suppressed_fp_items
         self.assertEqual(alert_body["suppressed_fp_items"], [])
         self.assertEqual(bar_a["timing"]["segment_count"], 4)
@@ -661,13 +694,13 @@ class TestReviewTrustAPI(unittest.TestCase):
         self.assertTrue(del_resp.json()["success"])
         self.assertEqual(self.client.get("/review/golden_clips").json()["total"], 0)
 
-    def test_maintainer_records_alert_timing_with_discovery_placeholder(self) -> None:
+    def test_maintainer_records_alert_timing_lifecycle_and_reverse_update(self) -> None:
         maintainer = ReviewSegmentMaintainer.__new__(ReviewSegmentMaintainer)
         maintainer.trust_store = self.trust_store
 
         segment = PendingReviewSegment(
             camera="front_door",
-            frame_time=6000.5,
+            frame_time=6000.8,
             severity=SeverityEnum.alert,
             detections={"obj-1": "person"},
             sub_labels={},
@@ -676,11 +709,15 @@ class TestReviewTrustAPI(unittest.TestCase):
         )
         maintainer._record_alert_timing(
             segment,
-            alert_time=6000.5,
+            alert_time=6000.8,
             alert_objects=[
                 {
                     "id": "obj-1",
-                    "start_time": 6000.0,
+                    "first_detect_time": 6000.0,
+                    "start_time": 6000.15,
+                    "confirmed_time": 6000.55,
+                    "secondlook_request_time": 6000.20,
+                    "secondlook_answer_time": 6000.48,
                     "accumulated_resource_busy_ms": 27.5,
                 }
             ],
@@ -688,20 +725,56 @@ class TestReviewTrustAPI(unittest.TestCase):
 
         rows = self.trust_store.get_timings_in_range(5999.0, 6002.0, severity="alert")
         self.assertEqual(len(rows), 1)
-        self.assertEqual(rows[0]["review_id"], segment.id)
-        self.assertEqual(rows[0]["severity"], "alert")
-        self.assertAlmostEqual(rows[0]["discovery_ms"], 0.0)
-        self.assertAlmostEqual(rows[0]["resource_busy_ms"], 27.5)
-        self.assertAlmostEqual(rows[0]["confirmation_ms"], 500.0)
-        self.assertAlmostEqual(rows[0]["total_ms"], 527.5)
+        row = rows[0]
+        self.assertEqual(row["review_id"], segment.id)
+        self.assertEqual(row["severity"], "alert")
+        self.assertAlmostEqual(row["discovery_ms"], 0.0)
+        self.assertAlmostEqual(row["tracking_ms"], 150.0, places=2)
+        self.assertAlmostEqual(row["confirmation_ms"], 400.0, places=2)
+        self.assertAlmostEqual(row["zone_delay_ms"], 250.0, places=2)
+        # Pure telescoping sum: 0 + 150 + 400 + 250 = 800ms (resource_busy_ms NOT double-counted)
+        self.assertAlmostEqual(row["total_ms"], 800.0, places=2)
+        self.assertAlmostEqual(row["secondlook_request_time"], 6000.20, places=3)
+        self.assertAlmostEqual(row["secondlook_answer_time"], 6000.48, places=3)
 
-    def test_detection_timing_zero_confirmation_and_outlier_guard(self) -> None:
+        # Reverse Norfair asynchronously updates discovery_ms -> total_ms becomes 1150ms
+        updated = self.trust_store.update_discovery_timing(
+            segment.id,
+            first_visible_time=5999.65,
+            discovery_ms=350.0,
+            status="done",
+        )
+        self.assertIsNotNone(updated)
+        assert updated is not None
+        self.assertEqual(updated["reverse_norfair_status"], "done")
+        self.assertAlmostEqual(updated["first_visible_time"], 5999.65, places=3)
+        self.assertAlmostEqual(updated["discovery_ms"], 350.0, places=2)
+        self.assertAlmostEqual(updated["total_ms"], 1150.0, places=2)
+
+        # A subsequent upsert must preserve already-completed Reverse Norfair discovery
+        again = self.trust_store.record_alert_timing(
+            review_id=segment.id,
+            camera="front_door",
+            alert_time=6000.8,
+            first_detected_time=6000.0,
+            track_start_time=6000.15,
+            confirmed_time=6000.55,
+            discovery_ms=0.0,
+            tracking_ms=150.0,
+            confirmation_ms=400.0,
+            zone_delay_ms=250.0,
+        )
+        self.assertEqual(again["reverse_norfair_status"], "done")
+        self.assertAlmostEqual(again["discovery_ms"], 350.0, places=2)
+        self.assertAlmostEqual(again["total_ms"], 1150.0, places=2)
+
+    def test_detection_timing_lifecycle_and_outlier_guard(self) -> None:
         maintainer = ReviewSegmentMaintainer.__new__(ReviewSegmentMaintainer)
         maintainer.trust_store = self.trust_store
         end_ts = 1_700_000_000.0
         t = end_ts - 600.0
 
-        # Detection segment must always record confirmation_ms=0.0
+        # Detection segment records tracking_ms + confirmation_ms, with zone_delay_ms=0.0
         det_seg = PendingReviewSegment(
             camera="front_door",
             frame_time=t,
@@ -711,13 +784,16 @@ class TestReviewTrustAPI(unittest.TestCase):
             zones=[],
             audio=set(),
         )
+        self._insert_segment(det_seg.id, start_time=t, severity="detection")
         maintainer._record_alert_timing(
             det_seg,
             alert_time=t,
             alert_objects=[
                 {
                     "id": "obj-det",
-                    "start_time": t - 1.5,
+                    "first_detect_time": t - 0.6,
+                    "start_time": t - 0.4,
+                    "confirmed_time": t,
                     "accumulated_resource_busy_ms": 42.0,
                 }
             ],
@@ -734,6 +810,7 @@ class TestReviewTrustAPI(unittest.TestCase):
             zones=["driveway"],
             audio=set(),
         )
+        self._insert_segment(reactivated_seg.id, start_time=t + 10.0, severity="alert")
         maintainer._record_alert_timing(
             reactivated_seg,
             alert_time=t + 10.0,
@@ -758,6 +835,7 @@ class TestReviewTrustAPI(unittest.TestCase):
             zones=["driveway"],
             audio=set(),
         )
+        self._insert_segment(stale_seg.id, start_time=t + 20.0, severity="alert")
         maintainer._record_alert_timing(
             stale_seg,
             alert_time=t + 20.0,
@@ -772,12 +850,13 @@ class TestReviewTrustAPI(unittest.TestCase):
         )
 
         # Simulate a legacy pre-fix 720s outlier already in review_trust.db
+        self._insert_segment("legacy-720s", start_time=t + 30.0, severity="alert")
         self.trust_store.record_alert_timing(
             review_id="legacy-720s",
             camera="front_door",
             alert_time=t + 30.0,
             discovery_ms=0.0,
-            resource_busy_ms=20.0,
+            tracking_ms=0.0,
             confirmation_ms=720_000.0,
             severity="alert",
         )
@@ -788,19 +867,22 @@ class TestReviewTrustAPI(unittest.TestCase):
         ).json()
         alert_timing = alert_body["buckets"][29]["timing"]
         self.assertEqual(alert_timing["count"], 1)
+        self.assertAlmostEqual(alert_timing["avg_tracking_ms"], 0.0, places=1)
         self.assertAlmostEqual(alert_timing["avg_confirmation_ms"], 400.0, places=1)
-        self.assertAlmostEqual(alert_timing["avg_resource_busy_ms"], 18.0, places=1)
+        self.assertAlmostEqual(alert_timing["avg_zone_delay_ms"], 0.0, places=1)
+        self.assertAlmostEqual(alert_timing["avg_total_ms"], 400.0, places=1)
         self.assertEqual(alert_timing["slowest_review_id"], reactivated_seg.id)
 
-        # Detection overview sees det_seg with confirmation_ms == 0.0
+        # Detection overview sees det_seg with tracking_ms=200ms, confirmation_ms=400ms, zone_delay_ms=0ms
         det_body = self.client.get(
             "/review/overview", params={"severity": "detection", "end_time": end_ts}
         ).json()
         det_timing = det_body["buckets"][29]["timing"]
         self.assertEqual(det_timing["count"], 1)
-        self.assertAlmostEqual(det_timing["avg_confirmation_ms"], 0.0)
-        self.assertAlmostEqual(det_timing["avg_resource_busy_ms"], 42.0)
-        self.assertAlmostEqual(det_timing["avg_total_ms"], 42.0)
+        self.assertAlmostEqual(det_timing["avg_tracking_ms"], 200.0, places=1)
+        self.assertAlmostEqual(det_timing["avg_confirmation_ms"], 400.0, places=1)
+        self.assertAlmostEqual(det_timing["avg_zone_delay_ms"], 0.0, places=1)
+        self.assertAlmostEqual(det_timing["avg_total_ms"], 600.0, places=1)
 
     def test_legacy_db_migrates_alert_timings_severity_column(self) -> None:
         import sqlite3
@@ -835,6 +917,119 @@ class TestReviewTrustAPI(unittest.TestCase):
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["review_id"], "old-1")
         self.assertEqual(rows[0]["severity"], "alert")
+        self.assertAlmostEqual(rows[0]["tracking_ms"], 0.0)
+        self.assertAlmostEqual(rows[0]["zone_delay_ms"], 0.0)
+
+
+class TestReverseNorfair(unittest.TestCase):
+    def test_ring_buffer_sampling_and_reverse_order(self) -> None:
+        import numpy as np
+
+        from frigate.review.reverse_norfair import CameraFrameRingBuffer
+
+        buf = CameraFrameRingBuffer(max_frames=5, min_interval=0.2)
+        frame = np.zeros((240, 320, 3), dtype=np.uint8)
+
+        self.assertTrue(buf.push_rgb("cam1", 100.0, frame))
+        # Too soon (< 0.2s) -> ignored
+        self.assertFalse(buf.push_rgb("cam1", 100.05, frame))
+        self.assertTrue(buf.push_rgb("cam1", 100.25, frame))
+        self.assertTrue(buf.push_rgb("cam1", 100.50, frame))
+        self.assertTrue(buf.push_rgb("cam1", 100.75, frame))
+
+        snap = buf.snapshot_before("cam1", 100.75, lookback_sec=2.0)
+        times = [entry[0] for entry in snap]
+        self.assertEqual(times, [100.50, 100.25, 100.0])
+
+    def test_reverse_norfair_walks_backward_stops_on_misses_and_preempts(self) -> None:
+        import numpy as np
+
+        from frigate.review.reverse_norfair import run_reverse_norfair
+
+        # Synthetic 640x480 camera frames where a person (rendered as a bright box)
+        # walks right (+20px/frame):
+        # t=100.0..100.4 (not visible), t=100.6 (x=160..220), t=100.8 (x=180..240),
+        # t=101.0 (x=200..260), first_detect_time=101.2 (seed_box=[220,150,280,310],
+        # seed_box_later=[240,150,300,310]).
+        width, height = 640, 480
+        box_by_ts: dict[float, list[int] | None] = {
+            100.0: None,
+            100.2: None,
+            100.4: None,
+            100.6: [160, 150, 220, 310],  # earliest visible!
+            100.8: [180, 150, 240, 310],
+            101.0: [200, 150, 260, 310],
+        }
+        frames_rev = []
+        for ts in [101.0, 100.8, 100.6, 100.4, 100.2, 100.0]:
+            rgb = np.zeros((height, width, 3), dtype=np.uint8)
+            box = box_by_ts[ts]
+            if box is not None:
+                x1, y1, x2, y2 = box
+                rgb[y1:y2, x1:x2] = 255
+            frames_rev.append((ts, rgb, width, height))
+
+        # Mock detector finds the bright box inside whatever crop Reverse Norfair
+        # passes, exercising real crop + box_norm -> full-frame coordinate mapping!
+        def mock_detector(crop: np.ndarray) -> tuple[list[dict[str, object]], float]:
+            ys, xs = np.where(crop[:, :, 0] > 128)
+            if len(xs) == 0:
+                return [], 1.0
+            ch, cw = crop.shape[:2]
+            x1, x2 = int(xs.min()), int(xs.max()) + 1
+            y1, y2 = int(ys.min()), int(ys.max()) + 1
+            return [
+                {
+                    "label": "person",
+                    "score": 0.72,
+                    "box_norm": [y1 / ch, x1 / cw, y2 / ch, x2 / cw],
+                }
+            ], 1.0
+
+        res = run_reverse_norfair(
+            frames_rev=frames_rev,
+            label="person",
+            first_detect_time=101.2,
+            seed_box=[220, 150, 280, 310],
+            seed_box_later=[240, 150, 300, 310],
+            detector_fn=mock_detector,
+            input_size=320,
+            context_scale=2.5,
+            min_score=0.25,
+            max_missed_frames=2,
+        )
+        self.assertFalse(res.preempted)
+        self.assertEqual(res.frames_matched, 3)
+        # Checked 3 matched frames + stopped after 2 consecutive misses (100.4, 100.2) = 5 frames checked
+        self.assertEqual(res.frames_checked, 5)
+        self.assertAlmostEqual(res.first_visible_time, 100.6, places=3)
+        self.assertAlmostEqual(res.discovery_ms, 600.0, places=1)
+        self.assertEqual(res.earliest_box, [160, 150, 220, 310])
+
+        # Preemption check: stops immediately when live work arrives
+        calls = 0
+
+        def preempt_after_one() -> bool:
+            return calls >= 1
+
+        def counting_detector(crop: np.ndarray) -> tuple[list[dict[str, object]], float]:
+            nonlocal calls
+            calls += 1
+            return mock_detector(crop)
+
+        res_preempt = run_reverse_norfair(
+            frames_rev=frames_rev,
+            label="person",
+            first_detect_time=101.2,
+            seed_box=[220, 150, 280, 310],
+            detector_fn=counting_detector,
+            input_size=320,
+            context_scale=2.5,
+            should_preempt=preempt_after_one,
+        )
+        self.assertTrue(res_preempt.preempted)
+        self.assertEqual(res_preempt.frames_checked, 1)
+        self.assertAlmostEqual(res_preempt.first_visible_time, 101.0, places=3)
 
 
 if __name__ == "__main__":

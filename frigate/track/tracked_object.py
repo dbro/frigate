@@ -132,8 +132,16 @@ class TrackedObject:
         self.accumulated_resource_busy_ms: float = float(
             obj_data.get("frame_resource_busy_ms") or 0.0
         )
+        self.first_detect_time: float = float(
+            obj_data.get("first_detect_time") or obj_data.get("start_time") or 0.0
+        )
+        self.first_detect_box: list[int] = list(
+            obj_data.get("first_detect_box") or obj_data.get("box") or []
+        )
         self.last_active_time: float = float(obj_data.get("start_time") or 0.0)
         self.confirmed_time: float | None = None
+        self.secondlook_request_time: float | None = None
+        self.secondlook_answer_time: float | None = None
         self.previous = self.to_dict()
 
     @property
@@ -229,6 +237,8 @@ class TrackedObject:
                 self.secondlook_hold_done = True
             else:
                 self.secondlook_pending_since = new_pending
+                if self.secondlook_request_time is None and new_pending is not None:
+                    self.secondlook_request_time = float(new_pending)
         return is_fp
 
     def _remember_correction(self, raw_median, threshold, was_fp, decision_time):
@@ -307,6 +317,8 @@ class TrackedObject:
             if not self.secondlook_hold_done:
                 self.obj_data["secondlook"] = payload
                 self.secondlook_running = True
+                if self.secondlook_request_time is None and payload.get("frame_time") is not None:
+                    self.secondlook_request_time = float(payload["frame_time"])
             return
 
         if (
@@ -347,6 +359,14 @@ class TrackedObject:
         self.secondlook_pending_since = None
         self.secondlook_hold_done = True
         self.secondlook_result_seen = True
+        if self.secondlook_answer_time is None:
+            ans_ts = (
+                self._secondlook_frame_time
+                or self.obj_data.get("frame_time")
+                or payload.get("frame_time")
+            )
+            if ans_ts is not None:
+                self.secondlook_answer_time = float(ans_ts)
         factor = payload.get("factor")
         self.secondlook_factor = None if factor is None else float(factor)
         if self.secondlook_factor is not None:
@@ -798,8 +818,12 @@ class TrackedObject:
             "path_data": self.path_data.copy(),
             "recognized_license_plate": self.obj_data.get("recognized_license_plate"),
             "accumulated_resource_busy_ms": self.accumulated_resource_busy_ms,
+            "first_detect_time": self.first_detect_time,
+            "first_detect_box": self.first_detect_box.copy(),
             "last_active_time": self.last_active_time,
             "confirmed_time": self.confirmed_time,
+            "secondlook_request_time": self.secondlook_request_time,
+            "secondlook_answer_time": self.secondlook_answer_time,
         }
 
         # Add any other obj_data keys (e.g. custom attribute fields) not yet included

@@ -85,8 +85,10 @@ export interface TrustOverviewBucketTiming {
   count: number;
   segment_count?: number;
   avg_discovery_ms: number;
+  avg_tracking_ms?: number;
   avg_resource_busy_ms: number;
   avg_confirmation_ms: number;
+  avg_zone_delay_ms?: number;
   avg_total_ms: number;
   slowest_ms: number;
   slowest_review_id: string | null;
@@ -112,13 +114,22 @@ export interface ReviewClipObjectInfo {
 
 export interface ReviewClipTiming {
   review_id: string;
-  severity: ReviewOverviewSeverity;
+  severity: ReviewOverviewSeverity | "suppressed_fp";
   alert_time: number;
+  first_visible_time?: number;
   first_detected_time: number;
+  track_start_time?: number;
+  confirmed_time?: number;
+  secondlook_request_time?: number | null;
+  secondlook_answer_time?: number | null;
   discovery_ms: number;
+  tracking_ms?: number;
   resource_busy_ms: number;
   confirmation_ms: number;
+  zone_delay_ms?: number;
+  pipeline_lag_ms?: number;
   total_ms: number;
+  reverse_norfair_status?: string;
 }
 
 export interface ReviewTimingDetailResponse extends ReviewClipTiming {
@@ -161,6 +172,7 @@ export interface SuppressedFpItem {
   zones: string[];
   mark?: string | null;
   has_still: boolean;
+  timing?: ReviewClipTiming | null;
 }
 
 export interface ReviewOverviewResponse {

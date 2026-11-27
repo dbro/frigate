@@ -328,7 +328,7 @@ export default function ReviewClipInfoBadge({
             </div>
           )}
 
-          {/* Per-Clip Alert / Detection Timing */}
+          {/* Per-Clip Alert / Detection Timing (pure timestamp differences) */}
           <div className="border-t border-border pt-1.5 text-[11px]">
             <div className="mb-1 text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">
               {isAlert ? "Alert Timing" : "Detection Timing"}
@@ -338,7 +338,7 @@ export default function ReviewClipInfoBadge({
                 <div className="flex justify-between gap-2">
                   <span className="inline-flex items-center gap-1.5 text-muted-foreground">
                     <span className="size-2 rounded-sm bg-slate-400" />
-                    Discovery
+                    Discovery (Request)
                   </span>
                   <span className="font-mono">
                     {(timing.discovery_ms / 1000).toFixed(2)}s
@@ -347,20 +347,29 @@ export default function ReviewClipInfoBadge({
                 <div className="flex justify-between gap-2">
                   <span className="inline-flex items-center gap-1.5 text-amber-600 dark:text-amber-400">
                     <span className="size-2 rounded-sm bg-amber-500" />
-                    Resource Busy
+                    Tracking
                   </span>
                   <span className="font-mono">
-                    {(timing.resource_busy_ms / 1000).toFixed(2)}s
+                    {((timing.tracking_ms ?? 0) / 1000).toFixed(2)}s
                   </span>
                 </div>
-                {isAlert && (
+                <div className="flex justify-between gap-2">
+                  <span className="inline-flex items-center gap-1.5 text-violet-600 dark:text-violet-400">
+                    <span className="size-2 rounded-sm bg-violet-500" />
+                    Confirmation
+                  </span>
+                  <span className="font-mono">
+                    {(timing.confirmation_ms / 1000).toFixed(2)}s
+                  </span>
+                </div>
+                {isAlert && (timing.zone_delay_ms ?? 0) > 0 && (
                   <div className="flex justify-between gap-2">
-                    <span className="inline-flex items-center gap-1.5 text-violet-600 dark:text-violet-400">
-                      <span className="size-2 rounded-sm bg-violet-500" />
-                      Confirmation
+                    <span className="inline-flex items-center gap-1.5 text-cyan-600 dark:text-cyan-400">
+                      <span className="size-2 rounded-sm bg-cyan-500" />
+                      Zone / Alert
                     </span>
                     <span className="font-mono">
-                      {(timing.confirmation_ms / 1000).toFixed(2)}s
+                      {((timing.zone_delay_ms ?? 0) / 1000).toFixed(2)}s
                     </span>
                   </div>
                 )}

@@ -9,6 +9,7 @@ import random
 import string
 import sys
 import threading
+import time
 from multiprocessing.synchronize import Event as MpEvent
 from pathlib import Path
 from typing import Any
@@ -328,11 +329,14 @@ class ReviewSegmentMaintainer(threading.Thread):
         alert_objects: list[dict[str, Any]],
         severity: str = "alert",
     ) -> None:
-        """Record alert/detection latency breakdown into ReviewTrustStore.
+        """Record pure timestamp-difference lifecycle timings into ReviewTrustStore.
 
-        Note: ``discovery_ms`` is kept at ``0.0`` as an explicit placeholder for
-        future Reverse Norfair frame-discovery tracking. For ``detection``
-        segments, ``confirmation_ms`` is always ``0.0``.
+        Lifecycle milestones (all in video ``frame_time`` seconds):
+          t_first_visible (populated asynchronously by Reverse Norfair)
+          --discovery_ms--> t_first_detect (first detector hit > min_score)
+          --tracking_ms---> t_track_start (Norfair track registration / reactivation)
+          --confirmation_ms--> t_confirmed (trailing-10 median > threshold, incl. Secondlook)
+          --zone_delay_ms----> t_alert (review segment start, e.g. alert zone entry/inertia)
         """
         store = getattr(self, "trust_store", None) or get_review_trust_store()
         if store is None:
@@ -340,9 +344,17 @@ class ReviewSegmentMaintainer(threading.Thread):
 
         from frigate.review.trust_store import MAX_VALID_TIMING_MS
 
+        alert_ts = float(alert_time)
+        first_detected_time = alert_ts
+        track_start_time = alert_ts
+        confirmed_time = alert_ts
+        sl_req_time: float | None = None
+        sl_ans_time: float | None = None
+        tracking_ms = 0.0
         confirmation_ms = 0.0
+        zone_delay_ms = 0.0
         resource_busy_ms = 0.0
-        first_detected_time: float = float(alert_time)
+
         if alert_objects:
             resource_busy_ms = min(
                 MAX_VALID_TIMING_MS,
@@ -351,47 +363,95 @@ class ReviewSegmentMaintainer(threading.Thread):
                     for o in alert_objects
                 ),
             )
-            if severity == "alert":
-                candidate_confirmations: list[tuple[float, float]] = []
-                for o in alert_objects:
-                    start_t = float(o.get("start_time", alert_time))
-                    last_active_t = float(o.get("last_active_time") or start_t)
-                    ref_start = max(start_t, last_active_t)
-                    elapsed_ms = max(0.0, (float(alert_time) - ref_start) * 1000.0)
-                    if elapsed_ms <= MAX_VALID_TIMING_MS:
-                        candidate_confirmations.append((elapsed_ms, ref_start))
-                        continue
-                    confirmed_t = o.get("confirmed_time")
-                    if confirmed_t is not None:
-                        conf_elapsed = max(
-                            0.0, (float(confirmed_t) - start_t) * 1000.0
-                        )
-                        if conf_elapsed <= MAX_VALID_TIMING_MS:
-                            candidate_confirmations.append((conf_elapsed, start_t))
-
-                if not candidate_confirmations:
-                    # All objects triggering this alert are long-lived tracks
-                    # (>30s old) with no fresh confirmation window; skip so
-                    # stationary/loitering track ages do not skew alert timing.
-                    return
-                confirmation_ms, first_detected_time = min(
-                    candidate_confirmations, key=lambda pair: pair[0]
+            candidates: list[tuple[float, dict[str, Any]]] = []
+            for o in alert_objects:
+                start_t = float(o.get("start_time", alert_ts))
+                last_active_t = float(o.get("last_active_time") or start_t)
+                reactivated = last_active_t > start_t + 0.05
+                t_track = last_active_t if reactivated else start_t
+                raw_first_det = o.get("first_detect_time")
+                t_first_det = (
+                    t_track
+                    if reactivated or raw_first_det is None
+                    else min(t_track, float(raw_first_det))
                 )
-            else:
-                first_detected_time = float(alert_time)
+                raw_conf = o.get("confirmed_time")
+                if raw_conf is not None and not reactivated:
+                    t_conf = max(t_track, min(alert_ts, float(raw_conf)))
+                else:
+                    t_conf = alert_ts
 
-        # Placeholder for future Reverse Norfair pre-birth discovery latency
-        discovery_ms = 0.0
+                trk_ms = max(0.0, (t_track - t_first_det) * 1000.0)
+                conf_ms = max(0.0, (t_conf - t_track) * 1000.0)
+                zone_ms = (
+                    max(0.0, (alert_ts - t_conf) * 1000.0)
+                    if severity == "alert"
+                    else 0.0
+                )
+                total_pre_disc = trk_ms + conf_ms + zone_ms
+
+                # If an old track lingered >30s outside an alert zone before
+                # triggering, drop the loitering zone wait rather than letting
+                # a 700s track age skew confirmation metrics.
+                if total_pre_disc > MAX_VALID_TIMING_MS:
+                    if (trk_ms + conf_ms) <= MAX_VALID_TIMING_MS and raw_conf is not None:
+                        zone_ms = 0.0
+                        t_conf = alert_ts
+                        total_pre_disc = trk_ms + conf_ms
+                    else:
+                        continue
+
+                candidates.append(
+                    (
+                        total_pre_disc,
+                        {
+                            "first_detected_time": t_first_det,
+                            "track_start_time": t_track,
+                            "confirmed_time": t_conf,
+                            "tracking_ms": trk_ms,
+                            "confirmation_ms": conf_ms,
+                            "zone_delay_ms": zone_ms,
+                            "secondlook_request_time": o.get("secondlook_request_time"),
+                            "secondlook_answer_time": o.get("secondlook_answer_time"),
+                        },
+                    )
+                )
+
+            if not candidates:
+                # All objects triggering this segment are long-lived tracks
+                # (>30s old) with no fresh confirmation window.
+                return
+
+            _, best = min(candidates, key=lambda pair: pair[0])
+            first_detected_time = best["first_detected_time"]
+            track_start_time = best["track_start_time"]
+            confirmed_time = best["confirmed_time"]
+            tracking_ms = best["tracking_ms"]
+            confirmation_ms = best["confirmation_ms"]
+            zone_delay_ms = best["zone_delay_ms"]
+            sl_req_time = best["secondlook_request_time"]
+            sl_ans_time = best["secondlook_answer_time"]
+
+        pipeline_lag_ms = max(0.0, min(MAX_VALID_TIMING_MS, (time.time() - alert_ts) * 1000.0))
         try:
             store.record_alert_timing(
                 review_id=segment.id,
                 camera=segment.camera,
-                alert_time=float(alert_time),
+                alert_time=alert_ts,
+                first_visible_time=first_detected_time,
                 first_detected_time=first_detected_time,
-                discovery_ms=discovery_ms,
+                track_start_time=track_start_time,
+                confirmed_time=confirmed_time,
+                secondlook_request_time=sl_req_time,
+                secondlook_answer_time=sl_ans_time,
+                discovery_ms=0.0,
+                tracking_ms=tracking_ms,
                 resource_busy_ms=resource_busy_ms,
                 confirmation_ms=confirmation_ms,
+                zone_delay_ms=zone_delay_ms,
+                pipeline_lag_ms=pipeline_lag_ms,
                 severity=severity,
+                reverse_norfair_status="pending",
             )
         except Exception:
             logger.debug(
@@ -680,13 +740,13 @@ class ReviewSegmentMaintainer(threading.Thread):
                             zones=list(new_zones),
                         )
                         self.active_review_segments[segment.camera] = new_segment
-                        self._publish_segment_start(new_segment)
                         self._record_alert_timing(
                             new_segment,
                             end_time,
                             activity.categorized_objects["detections"],
                             severity="detection",
                         )
+                        self._publish_segment_start(new_segment)
                         new_segment.last_detection_time = last_detection_time
             elif segment.severity == SeverityEnum.detection and frame_time > (
                 segment.last_detection_time
@@ -760,7 +820,6 @@ class ReviewSegmentMaintainer(threading.Thread):
                         camera_config, yuv_frame, activity.get_all_objects()
                     )
                     self.frame_manager.close(frame_name)
-                    self._publish_segment_start(new_segment)
                     if severity == SeverityEnum.alert:
                         self._record_alert_timing(
                             new_segment,
@@ -775,6 +834,7 @@ class ReviewSegmentMaintainer(threading.Thread):
                             activity.categorized_objects["detections"],
                             severity="detection",
                         )
+                    self._publish_segment_start(new_segment)
                 except FileNotFoundError:
                     return
 

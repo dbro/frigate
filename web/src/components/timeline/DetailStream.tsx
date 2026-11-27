@@ -610,20 +610,24 @@ function ReviewGroup({
                 {timingData.available &&
                   (() => {
                     const discSec = timingData.discovery_ms / 1000;
-                    const busySec = timingData.resource_busy_ms / 1000;
-                    const confSec = isAlertReview
-                      ? timingData.confirmation_ms / 1000
+                    const trkSec = (timingData.tracking_ms ?? 0) / 1000;
+                    const confSec = timingData.confirmation_ms / 1000;
+                    const zoneSec = isAlertReview
+                      ? (timingData.zone_delay_ms ?? 0) / 1000
                       : 0;
                     const totalSec = Math.max(
                       0.001,
-                      discSec + busySec + confSec,
+                      discSec + trkSec + confSec + zoneSec,
                     );
                     const scaleMax = Math.max(2.0, totalSec);
+                    const firstVisTs =
+                      timingData.first_visible_time ??
+                      Math.max(0, timingData.first_detected_time - discSec);
                     const firstDetectTs = timingData.first_detected_time;
-                    const discoveryStartTs = Math.max(
-                      0,
-                      firstDetectTs - discSec,
-                    );
+                    const trackStartTs =
+                      timingData.track_start_time ?? firstDetectTs + trkSec;
+                    const confirmedTs =
+                      timingData.confirmed_time ?? trackStartTs + confSec;
                     const alertTs = timingData.alert_time;
                     const seekToDetectTime = (ts: number) => {
                       onActivate?.();
@@ -642,19 +646,27 @@ function ReviewGroup({
                               }}
                             />
                           )}
-                          {busySec > 0 && (
+                          {trkSec > 0 && (
                             <div
                               style={{
-                                width: `${(busySec / scaleMax) * 100}%`,
+                                width: `${(trkSec / scaleMax) * 100}%`,
                                 backgroundColor: "#f59e0b",
                               }}
                             />
                           )}
-                          {isAlertReview && confSec > 0 && (
+                          {confSec > 0 && (
                             <div
                               style={{
                                 width: `${(confSec / scaleMax) * 100}%`,
                                 backgroundColor: "#8b5cf6",
+                              }}
+                            />
+                          )}
+                          {isAlertReview && zoneSec > 0 && (
+                            <div
+                              style={{
+                                width: `${(zoneSec / scaleMax) * 100}%`,
+                                backgroundColor: "#06b6d4",
                               }}
                             />
                           )}
@@ -665,23 +677,29 @@ function ReviewGroup({
                           />
                         </div>
 
-                        {/* Clickable timing points with hundredths of a second */}
+                        {/* Clickable timestamp-to-timestamp lifecycle points */}
                         <div className="space-y-1 text-[11px]">
                           <button
                             type="button"
-                            onClick={() => seekToDetectTime(discoveryStartTs)}
+                            onClick={() => seekToDetectTime(firstVisTs)}
                             className="flex w-full items-center justify-between gap-2 rounded px-1 py-0.5 text-left transition hover:bg-muted/70"
-                            title="Seek to discovery point"
+                            title="Seek to first visible frame (Reverse Norfair)"
                           >
                             <span className="inline-flex items-center gap-1.5 text-muted-foreground">
                               <span className="size-2 shrink-0 rounded-sm bg-slate-400" />
                               Discovery
+                              {timingData.reverse_norfair_status ===
+                                "pending" && (
+                                <span className="text-[10px] opacity-70">
+                                  (pending)
+                                </span>
+                              )}
                             </span>
                             <span className="flex items-center gap-2 font-mono">
                               <span>{discSec.toFixed(2)}s</span>
                               <span className="text-muted-foreground">
                                 {formatUnixTimestampToTimeWithCentiseconds(
-                                  discoveryStartTs,
+                                  firstVisTs,
                                   is24Hour,
                                   config.ui.timezone,
                                 )}
@@ -693,14 +711,14 @@ function ReviewGroup({
                             type="button"
                             onClick={() => seekToDetectTime(firstDetectTs)}
                             className="flex w-full items-center justify-between gap-2 rounded px-1 py-0.5 text-left transition hover:bg-muted/70"
-                            title="Seek to first detected frame (detector queue wait)"
+                            title="Seek to first primary detection (> min_score)"
                           >
                             <span className="inline-flex items-center gap-1.5 text-amber-600 dark:text-amber-400">
                               <span className="size-2 shrink-0 rounded-sm bg-amber-500" />
-                              Resource Busy
+                              Tracking
                             </span>
                             <span className="flex items-center gap-2 font-mono">
-                              <span>{busySec.toFixed(2)}s</span>
+                              <span>{trkSec.toFixed(2)}s</span>
                               <span className="text-muted-foreground">
                                 {formatUnixTimestampToTimeWithCentiseconds(
                                   firstDetectTs,
@@ -711,19 +729,41 @@ function ReviewGroup({
                             </span>
                           </button>
 
-                          {isAlertReview && (
+                          <button
+                            type="button"
+                            onClick={() => seekToDetectTime(confirmedTs)}
+                            className="flex w-full items-center justify-between gap-2 rounded px-1 py-0.5 text-left transition hover:bg-muted/70"
+                            title="Seek to confirmation frame (median > threshold)"
+                          >
+                            <span className="inline-flex items-center gap-1.5 text-violet-600 dark:text-violet-400">
+                              <span className="size-2 shrink-0 rounded-sm bg-violet-500" />
+                              Confirmation
+                            </span>
+                            <span className="flex items-center gap-2 font-mono">
+                              <span>{confSec.toFixed(2)}s</span>
+                              <span className="text-muted-foreground">
+                                {formatUnixTimestampToTimeWithCentiseconds(
+                                  trackStartTs,
+                                  is24Hour,
+                                  config.ui.timezone,
+                                )}
+                              </span>
+                            </span>
+                          </button>
+
+                          {isAlertReview && zoneSec > 0 && (
                             <button
                               type="button"
                               onClick={() => seekToDetectTime(alertTs)}
                               className="flex w-full items-center justify-between gap-2 rounded px-1 py-0.5 text-left transition hover:bg-muted/70"
-                              title="Seek to alert confirmation frame"
+                              title="Seek to alert zone trigger frame"
                             >
-                              <span className="inline-flex items-center gap-1.5 text-violet-600 dark:text-violet-400">
-                                <span className="size-2 shrink-0 rounded-sm bg-violet-500" />
-                                Confirmation
+                              <span className="inline-flex items-center gap-1.5 text-cyan-600 dark:text-cyan-400">
+                                <span className="size-2 shrink-0 rounded-sm bg-cyan-500" />
+                                Zone / Alert
                               </span>
                               <span className="flex items-center gap-2 font-mono">
-                                <span>{confSec.toFixed(2)}s</span>
+                                <span>{zoneSec.toFixed(2)}s</span>
                                 <span className="text-muted-foreground">
                                   {formatUnixTimestampToTimeWithCentiseconds(
                                     alertTs,
@@ -733,6 +773,38 @@ function ReviewGroup({
                                 </span>
                               </span>
                             </button>
+                          )}
+
+                          {timingData.secondlook_request_time != null && (
+                            <div className="mt-1 flex items-center justify-between gap-2 border-t border-border/50 px-1 pt-1 text-[10px] text-muted-foreground">
+                              <span>Secondlook</span>
+                              <span className="font-mono">
+                                {formatUnixTimestampToTimeWithCentiseconds(
+                                  timingData.secondlook_request_time,
+                                  is24Hour,
+                                  config.ui.timezone,
+                                )}
+                                {timingData.secondlook_answer_time != null
+                                  ? ` → ${formatUnixTimestampToTimeWithCentiseconds(
+                                      timingData.secondlook_answer_time,
+                                      is24Hour,
+                                      config.ui.timezone,
+                                    )}`
+                                  : " (pending)"}
+                              </span>
+                            </div>
+                          )}
+
+                          {(timingData.pipeline_lag_ms ?? 0) > 0 && (
+                            <div className="flex items-center justify-between gap-2 px-1 text-[10px] text-muted-foreground">
+                              <span>Live pipeline lag</span>
+                              <span className="font-mono">
+                                {(
+                                  (timingData.pipeline_lag_ms ?? 0) / 1000
+                                ).toFixed(2)}
+                                s
+                              </span>
+                            </div>
                           )}
                         </div>
                       </div>

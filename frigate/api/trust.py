@@ -216,8 +216,10 @@ def _empty_bucket(
             "count": 0,
             "segment_count": 0,
             "avg_discovery_ms": 0.0,
+            "avg_tracking_ms": 0.0,
             "avg_resource_busy_ms": 0.0,
             "avg_confirmation_ms": 0.0,
+            "avg_zone_delay_ms": 0.0,
             "avg_total_ms": 0.0,
             "slowest_ms": 0.0,
             "slowest_review_id": None,
@@ -424,32 +426,71 @@ def _query_secondlook_analyses(
 def _normalize_timing_row(
     row: dict[str, Any], severity: str
 ) -> dict[str, Any] | None:
-    """Apply detection zero-confirmation and >30s outlier guard to a timing row."""
-    disc_ms = max(0.0, float(row["discovery_ms"]))
-    busy_ms = max(0.0, float(row["resource_busy_ms"]))
-    conf_ms = (
+    """Normalize a timing row into pure non-overlapping timestamp-difference stages.
+
+    Stages (strictly telescoping in video frame_time):
+      discovery_ms    = t_first_detect - t_first_visible (Reverse Norfair)
+      tracking_ms     = t_track_start - t_first_detect   (Norfair initialization)
+      confirmation_ms = t_confirmed - t_track_start      (trailing-10 median + Secondlook)
+      zone_delay_ms   = t_alert - t_confirmed            (Alerts required-zone/inertia wait)
+    """
+    disc_ms = max(0.0, float(row.get("discovery_ms") or 0.0))
+    trk_ms = max(0.0, float(row.get("tracking_ms") or 0.0))
+    busy_ms = max(0.0, float(row.get("resource_busy_ms") or 0.0))
+    conf_ms = max(0.0, float(row.get("confirmation_ms") or 0.0))
+    zone_ms = (
         0.0
-        if severity == "detection"
-        else max(0.0, float(row["confirmation_ms"]))
+        if severity != "alert"
+        else max(0.0, float(row.get("zone_delay_ms") or 0.0))
     )
-    total_ms = disc_ms + busy_ms + conf_ms
+    lag_ms = max(0.0, float(row.get("pipeline_lag_ms") or 0.0))
+
+    # Pure telescoping sum from consecutive timestamp differences (no duration summing).
+    total_ms = disc_ms + trk_ms + conf_ms + zone_ms
     if total_ms > MAX_VALID_TIMING_MS:
         return None
+
     alert_time = float(row["alert_time"])
+    confirmed_time = float(
+        row.get("confirmed_time")
+        if row.get("confirmed_time") is not None
+        else max(0.0, alert_time - (zone_ms / 1000.0))
+    )
+    track_start_time = float(
+        row.get("track_start_time")
+        if row.get("track_start_time") is not None
+        else max(0.0, confirmed_time - (conf_ms / 1000.0))
+    )
     first_detected = float(
         row.get("first_detected_time")
         if row.get("first_detected_time") is not None
-        else max(0.0, alert_time - (conf_ms / 1000.0))
+        else max(0.0, track_start_time - (trk_ms / 1000.0))
     )
+    first_visible = float(
+        row.get("first_visible_time")
+        if row.get("first_visible_time") is not None
+        else max(0.0, first_detected - (disc_ms / 1000.0))
+    )
+    sl_req = row.get("secondlook_request_time")
+    sl_ans = row.get("secondlook_answer_time")
     return {
         "review_id": row["review_id"],
         "severity": severity,
         "alert_time": alert_time,
+        "first_visible_time": first_visible,
         "first_detected_time": first_detected,
+        "track_start_time": track_start_time,
+        "confirmed_time": confirmed_time,
+        "secondlook_request_time": float(sl_req) if sl_req is not None else None,
+        "secondlook_answer_time": float(sl_ans) if sl_ans is not None else None,
         "discovery_ms": round(disc_ms, 2),
+        "tracking_ms": round(trk_ms, 2),
         "resource_busy_ms": round(busy_ms, 2),
         "confirmation_ms": round(conf_ms, 2),
+        "zone_delay_ms": round(zone_ms, 2),
+        "pipeline_lag_ms": round(lag_ms, 2),
         "total_ms": round(total_ms, 2),
+        "reverse_norfair_status": str(row.get("reverse_norfair_status") or "pending"),
     }
 
 
@@ -622,11 +663,13 @@ async def get_review_overview(
         zone_filter=zone_filter,
     )
 
-    # Per-review timing lookup for both thumbnail info badges AND timing chart
-    # (ensures timing bars share exact same segment filtering & bucket index).
-    seg_timings_raw = trust_store.get_timings_for_ids(
-        [seg["id"] for seg in filtered_segments]
-    )
+    # Per-review timing lookup for segments + suppressed FPs
+    timing_lookup_ids = [seg["id"] for seg in filtered_segments]
+    if severity == "detection" and suppressed_fp_items:
+        timing_lookup_ids.extend(
+            f"sl_{item['track_id']}" for item in suppressed_fp_items
+        )
+    seg_timings_raw = trust_store.get_timings_for_ids(timing_lookup_ids)
 
     # Bucket filtered segments with strict 1-to-1 classification (no double counting):
     # 1. Human verdict in ('fp', 'fn', 'misclassified') -> counted ONLY below
@@ -795,11 +838,16 @@ async def get_review_overview(
             buckets[idx]["below"][verdict] += 1
             buckets[idx]["below"]["total"] += 1
 
-    # Detections view only: stack Secondlook auto-suppressed FPs above the line.
-    # Suppressed FPs never generate a Frigate ReviewSegment (event_id is NULL)
-    # and are returned in suppressed_fp_items so thumbnails appear below.
+    # Detections view only: stack Secondlook auto-suppressed FPs above the line
+    # and attach their lifecycle timing when available.
     if severity == "detection":
         for sl_item in suppressed_fp_items:
+            raw_sl_timing = seg_timings_raw.get(f"sl_{sl_item['track_id']}")
+            sl_item["timing"] = (
+                _normalize_timing_row(raw_sl_timing, "suppressed_fp")
+                if raw_sl_timing is not None
+                else None
+            )
             idx = _bucket_index(sl_item["start_time"], window_start, bar_seconds)
             if idx is None:
                 continue
@@ -823,9 +871,7 @@ async def get_review_overview(
             buckets[idx]["golden_clips"].append(clip)
 
     # Also include any timing rows whose review_id wasn't matched via
-    # filtered_segments only when no segment-level filters are active (covers
-    # live in-progress or pruned segments while preserving exact alignment when
-    # filtered segments exist).
+    # filtered_segments only when no segment-level filters are active.
     has_segment_filters = any(
         [
             label_filter,
@@ -860,11 +906,17 @@ async def get_review_overview(
             "avg_discovery_ms": round(
                 sum(r["discovery_ms"] for r in rows_in_bucket) / n, 2
             ),
+            "avg_tracking_ms": round(
+                sum(r["tracking_ms"] for r in rows_in_bucket) / n, 2
+            ),
             "avg_resource_busy_ms": round(
                 sum(r["resource_busy_ms"] for r in rows_in_bucket) / n, 2
             ),
             "avg_confirmation_ms": round(
                 sum(r["confirmation_ms"] for r in rows_in_bucket) / n, 2
+            ),
+            "avg_zone_delay_ms": round(
+                sum(r["zone_delay_ms"] for r in rows_in_bucket) / n, 2
             ),
             "avg_total_ms": round(sum(r["total_ms"] for r in rows_in_bucket) / n, 2),
             "slowest_ms": round(float(slowest["total_ms"]), 2),
@@ -904,7 +956,7 @@ async def get_review_timing(
     request: Request,
     review_id: str,
 ):
-    """Return Alert/Detection Timing breakdown for a single review segment."""
+    """Return timestamp-difference Alert/Detection Timing breakdown for a single review."""
     try:
         segment = ReviewSegment.get(ReviewSegment.id == review_id)
     except DoesNotExist:
@@ -919,18 +971,28 @@ async def get_review_timing(
     raw = trust_store.get_timing_for_review(review_id)
     norm = _normalize_timing_row(raw, sev) if raw is not None else None
     if norm is None:
+        seg_start = float(segment.start_time)
         return JSONResponse(
             content={
                 "review_id": review_id,
                 "camera": segment.camera,
                 "severity": sev,
                 "available": False,
-                "alert_time": float(segment.start_time),
-                "first_detected_time": float(segment.start_time),
+                "alert_time": seg_start,
+                "first_visible_time": seg_start,
+                "first_detected_time": seg_start,
+                "track_start_time": seg_start,
+                "confirmed_time": seg_start,
+                "secondlook_request_time": None,
+                "secondlook_answer_time": None,
                 "discovery_ms": 0.0,
+                "tracking_ms": 0.0,
                 "resource_busy_ms": 0.0,
                 "confirmation_ms": 0.0,
+                "zone_delay_ms": 0.0,
+                "pipeline_lag_ms": 0.0,
                 "total_ms": 0.0,
+                "reverse_norfair_status": "skipped",
             }
         )
     return JSONResponse(

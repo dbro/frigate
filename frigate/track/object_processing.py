@@ -67,6 +67,63 @@ def finish_secondlook_track(obj: TrackedObject, sl_config) -> None:
     if sl_config is not None and sl_config.save_and_review.enabled:
         # its own guard: a failed deposit must not cost the track its row
         secondlook_analyses.record_track(obj)
+    if getattr(obj, "secondlook_outcome", None) == "fp_suppressed":
+        try:
+            from frigate.review.trust_store import (
+                MAX_VALID_TIMING_MS,
+                get_review_trust_store,
+            )
+
+            trust_store = get_review_trust_store()
+            if trust_store is not None:
+                track_id = str(obj.obj_data.get("id"))
+                t_track = float(obj.obj_data.get("start_time") or 0.0)
+                t_first_det = min(
+                    t_track,
+                    float(getattr(obj, "first_detect_time", t_track) or t_track),
+                )
+                sl_ans = getattr(obj, "secondlook_answer_time", None)
+                t_decision = (
+                    float(sl_ans)
+                    if sl_ans is not None
+                    else float(
+                        obj.obj_data.get("end_time")
+                        or obj.obj_data.get("frame_time")
+                        or t_track
+                    )
+                )
+                t_decision = max(t_track, t_decision)
+                trk_ms = max(0.0, (t_track - t_first_det) * 1000.0)
+                conf_ms = max(0.0, (t_decision - t_track) * 1000.0)
+                if (trk_ms + conf_ms) <= MAX_VALID_TIMING_MS:
+                    trust_store.record_alert_timing(
+                        review_id=f"sl_{track_id}",
+                        camera=obj.camera_config.name,
+                        alert_time=t_decision,
+                        first_visible_time=t_first_det,
+                        first_detected_time=t_first_det,
+                        track_start_time=t_track,
+                        confirmed_time=t_decision,
+                        secondlook_request_time=getattr(
+                            obj, "secondlook_request_time", None
+                        ),
+                        secondlook_answer_time=sl_ans,
+                        discovery_ms=0.0,
+                        tracking_ms=trk_ms,
+                        resource_busy_ms=float(
+                            getattr(obj, "accumulated_resource_busy_ms", 0.0) or 0.0
+                        ),
+                        confirmation_ms=conf_ms,
+                        zone_delay_ms=0.0,
+                        severity="suppressed_fp",
+                        reverse_norfair_status="pending",
+                    )
+        except Exception:
+            logger.debug(
+                "Failed to record suppressed_fp timing for %s",
+                obj.obj_data.get("id"),
+                exc_info=True,
+            )
     try:
         save_track_for_review(obj, sl_config)
     except Exception:

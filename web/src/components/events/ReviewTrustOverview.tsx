@@ -179,8 +179,10 @@ function createEmptyBuckets(
       timing: {
         count: 0,
         avg_discovery_ms: 0,
+        avg_tracking_ms: 0,
         avg_resource_busy_ms: 0,
         avg_confirmation_ms: 0,
+        avg_zone_delay_ms: 0,
         avg_total_ms: 0,
         slowest_ms: 0,
         slowest_review_id: null,
@@ -418,9 +420,10 @@ export default function ReviewTrustOverview({
     let rawMax = 2.5;
     for (const b of buckets) {
       const discSec = (b.timing.avg_discovery_ms ?? 0) / 1000;
-      const busySec = (b.timing.avg_resource_busy_ms ?? 0) / 1000;
-      const confSec = isAlerts ? (b.timing.avg_confirmation_ms ?? 0) / 1000 : 0;
-      const avgTotalSec = discSec + busySec + confSec;
+      const trkSec = (b.timing.avg_tracking_ms ?? 0) / 1000;
+      const confSec = (b.timing.avg_confirmation_ms ?? 0) / 1000;
+      const zoneSec = isAlerts ? (b.timing.avg_zone_delay_ms ?? 0) / 1000 : 0;
+      const avgTotalSec = discSec + trkSec + confSec + zoneSec;
       const slowestSec = (b.timing.slowest_ms ?? 0) / 1000;
       rawMax = Math.max(rawMax, slowestSec, avgTotalSec);
     }
@@ -1027,8 +1030,8 @@ export default function ReviewTrustOverview({
             </span>
             <span className="text-xs text-muted-foreground">
               {isAlerts
-                ? "(Alerted events · Avg Discovery + Resource Busy + Confirmation vs 2.0s Goal)"
-                : "(Detected events · Avg Discovery + Resource Busy vs 2.0s Goal)"}
+                ? "(Alerted events · Avg Discovery + Tracking + Confirmation + Zone vs 2.0s Goal)"
+                : "(Detected events · Avg Discovery + Tracking + Confirmation vs 2.0s Goal)"}
             </span>
           </div>
           <div className="hidden items-center gap-3 text-xs text-muted-foreground sm:flex">
@@ -1038,12 +1041,16 @@ export default function ReviewTrustOverview({
             </span>
             <span className="inline-flex items-center gap-1">
               <span className="size-2.5 rounded-sm bg-amber-500" />
-              Resource Busy
+              Tracking
+            </span>
+            <span className="inline-flex items-center gap-1">
+              <span className="size-2.5 rounded-sm bg-violet-500" />
+              Confirmation
             </span>
             {isAlerts && (
               <span className="inline-flex items-center gap-1">
-                <span className="size-2.5 rounded-sm bg-violet-500" />
-                Confirmation
+                <span className="size-2.5 rounded-sm bg-cyan-500" />
+                Zone / Alert
               </span>
             )}
             <span className="inline-flex items-center gap-1">
@@ -1139,23 +1146,26 @@ export default function ReviewTrustOverview({
                 const bx = cx - barW / 2;
                 const hasTiming = bucket.timing.count > 0;
 
-                const discSec = bucket.timing.avg_discovery_ms / 1000;
-                const busySec = bucket.timing.avg_resource_busy_ms / 1000;
-                const confSec = isAlerts
-                  ? bucket.timing.avg_confirmation_ms / 1000
+                const discSec = (bucket.timing.avg_discovery_ms ?? 0) / 1000;
+                const trkSec = (bucket.timing.avg_tracking_ms ?? 0) / 1000;
+                const confSec = (bucket.timing.avg_confirmation_ms ?? 0) / 1000;
+                const zoneSec = isAlerts
+                  ? (bucket.timing.avg_zone_delay_ms ?? 0) / 1000
                   : 0;
-                const slowestSec = bucket.timing.slowest_ms / 1000;
+                const slowestSec = (bucket.timing.slowest_ms ?? 0) / 1000;
 
                 let curY = timingPadT + timingPlotH;
                 const segs = isAlerts
                   ? [
                       { sec: discSec, color: "#64748b" },
-                      { sec: busySec, color: "#f59e0b" },
+                      { sec: trkSec, color: "#f59e0b" },
                       { sec: confSec, color: "#8b5cf6" },
+                      { sec: zoneSec, color: "#06b6d4" },
                     ]
                   : [
                       { sec: discSec, color: "#64748b" },
-                      { sec: busySec, color: "#f59e0b" },
+                      { sec: trkSec, color: "#f59e0b" },
+                      { sec: confSec, color: "#8b5cf6" },
                     ];
 
                 const slowestY = Math.max(
@@ -1398,44 +1408,62 @@ export default function ReviewTrustOverview({
               </div>
               <div className="space-y-0.5">
                 <div className="flex justify-between gap-4">
-                  <span className="text-muted-foreground">Discovery</span>
+                  <span className="text-muted-foreground">
+                    Discovery (Reverse Norfair)
+                  </span>
                   <span className="font-mono">
-                    {(hover.bucket.timing.avg_discovery_ms / 1000).toFixed(2)}s
+                    {(
+                      (hover.bucket.timing.avg_discovery_ms ?? 0) / 1000
+                    ).toFixed(2)}
+                    s
                   </span>
                 </div>
                 <div className="flex justify-between gap-4">
                   <span className="text-amber-600 dark:text-amber-400">
-                    Resource Busy
+                    Tracking
                   </span>
                   <span className="font-mono">
-                    {(hover.bucket.timing.avg_resource_busy_ms / 1000).toFixed(
-                      2,
-                    )}
+                    {(
+                      (hover.bucket.timing.avg_tracking_ms ?? 0) / 1000
+                    ).toFixed(2)}
                     s
                   </span>
                 </div>
-                {isAlerts && (
-                  <div className="flex justify-between gap-4">
-                    <span className="text-violet-600 dark:text-violet-400">
-                      Confirmation
-                    </span>
-                    <span className="font-mono">
-                      {(hover.bucket.timing.avg_confirmation_ms / 1000).toFixed(
-                        2,
-                      )}
-                      s
-                    </span>
-                  </div>
-                )}
+                <div className="flex justify-between gap-4">
+                  <span className="text-violet-600 dark:text-violet-400">
+                    Confirmation
+                  </span>
+                  <span className="font-mono">
+                    {(
+                      (hover.bucket.timing.avg_confirmation_ms ?? 0) / 1000
+                    ).toFixed(2)}
+                    s
+                  </span>
+                </div>
+                {isAlerts &&
+                  (hover.bucket.timing.avg_zone_delay_ms ?? 0) > 0 && (
+                    <div className="flex justify-between gap-4">
+                      <span className="text-cyan-600 dark:text-cyan-400">
+                        Zone / Alert
+                      </span>
+                      <span className="font-mono">
+                        {(
+                          (hover.bucket.timing.avg_zone_delay_ms ?? 0) / 1000
+                        ).toFixed(2)}
+                        s
+                      </span>
+                    </div>
+                  )}
                 <div className="my-1 border-t border-border" />
                 <div className="flex justify-between gap-4 font-semibold">
                   <span>Average Total</span>
                   <span className="font-mono">
                     {(
                       ((hover.bucket.timing.avg_discovery_ms ?? 0) +
-                        (hover.bucket.timing.avg_resource_busy_ms ?? 0) +
+                        (hover.bucket.timing.avg_tracking_ms ?? 0) +
+                        (hover.bucket.timing.avg_confirmation_ms ?? 0) +
                         (isAlerts
-                          ? (hover.bucket.timing.avg_confirmation_ms ?? 0)
+                          ? (hover.bucket.timing.avg_zone_delay_ms ?? 0)
                           : 0)) /
                       1000
                     ).toFixed(2)}
@@ -1447,7 +1475,7 @@ export default function ReviewTrustOverview({
                     {isAlerts ? "Slowest Alert" : "Slowest Detection"}
                   </span>
                   <span className="font-mono">
-                    {(hover.bucket.timing.slowest_ms / 1000).toFixed(2)}s
+                    {((hover.bucket.timing.slowest_ms ?? 0) / 1000).toFixed(2)}s
                   </span>
                 </div>
                 {hover.bucket.timing.slowest_review_id && (

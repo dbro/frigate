@@ -288,6 +288,20 @@ class NorfairTracker(ObjectTracker):
         obj["score_history"] = (
             [p.data["score"] for p in obj_match.past_detections] if obj_match else []
         )
+        if obj_match and obj_match.past_detections:
+            earliest_det = min(
+                obj_match.past_detections,
+                key=lambda p: float(p.data.get("frame_time", obj["frame_time"])),
+            )
+            obj["first_detect_time"] = float(
+                earliest_det.data.get("frame_time", obj["frame_time"])
+            )
+            obj["first_detect_box"] = list(
+                earliest_det.data.get("box", obj["box"])
+            )
+        else:
+            obj["first_detect_time"] = float(obj["frame_time"])
+            obj["first_detect_box"] = list(obj["box"])
         self.tracked_objects[id] = obj
         self.disappeared[id] = 0
         if obj_match:

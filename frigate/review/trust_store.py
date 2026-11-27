@@ -65,15 +65,38 @@ CREATE TABLE IF NOT EXISTS alert_timings (
     camera TEXT NOT NULL,
     severity TEXT NOT NULL DEFAULT 'alert',
     alert_time REAL NOT NULL,
+    first_visible_time REAL,
     first_detected_time REAL,
+    track_start_time REAL,
+    confirmed_time REAL,
+    secondlook_request_time REAL,
+    secondlook_answer_time REAL,
     discovery_ms REAL NOT NULL DEFAULT 0.0,
+    tracking_ms REAL NOT NULL DEFAULT 0.0,
     resource_busy_ms REAL NOT NULL DEFAULT 0.0,
     confirmation_ms REAL NOT NULL DEFAULT 0.0,
-    total_ms REAL NOT NULL DEFAULT 0.0
+    zone_delay_ms REAL NOT NULL DEFAULT 0.0,
+    pipeline_lag_ms REAL NOT NULL DEFAULT 0.0,
+    total_ms REAL NOT NULL DEFAULT 0.0,
+    reverse_norfair_status TEXT NOT NULL DEFAULT 'pending'
 );
 CREATE INDEX IF NOT EXISTS idx_timings_time ON alert_timings(alert_time);
 CREATE INDEX IF NOT EXISTS idx_timings_camera_time ON alert_timings(camera, alert_time);
 """
+
+_ALERT_TIMINGS_MIGRATIONS: tuple[tuple[str, str], ...] = (
+    ("severity", "TEXT NOT NULL DEFAULT 'alert'"),
+    ("first_visible_time", "REAL"),
+    ("first_detected_time", "REAL"),
+    ("track_start_time", "REAL"),
+    ("confirmed_time", "REAL"),
+    ("secondlook_request_time", "REAL"),
+    ("secondlook_answer_time", "REAL"),
+    ("tracking_ms", "REAL NOT NULL DEFAULT 0.0"),
+    ("zone_delay_ms", "REAL NOT NULL DEFAULT 0.0"),
+    ("pipeline_lag_ms", "REAL NOT NULL DEFAULT 0.0"),
+    ("reverse_norfair_status", "TEXT NOT NULL DEFAULT 'pending'"),
+)
 
 
 def _parse_json_list(raw: str | None) -> list[str]:
@@ -121,26 +144,76 @@ def _golden_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
 
 
 def _timing_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
-    keys = row.keys()
+    keys = set(row.keys())
     severity = row["severity"] if "severity" in keys else "alert"
     alert_time = float(row["alert_time"])
+    disc_ms = float(row["discovery_ms"])
+    tracking_ms = float(row["tracking_ms"]) if "tracking_ms" in keys else 0.0
+    busy_ms = float(row["resource_busy_ms"])
     conf_ms = float(row["confirmation_ms"])
-    raw_first = row["first_detected_time"] if "first_detected_time" in keys else None
+    zone_ms = float(row["zone_delay_ms"]) if "zone_delay_ms" in keys else 0.0
+    lag_ms = float(row["pipeline_lag_ms"]) if "pipeline_lag_ms" in keys else 0.0
+
+    raw_confirmed = row["confirmed_time"] if "confirmed_time" in keys else None
+    confirmed_time = (
+        float(raw_confirmed)
+        if raw_confirmed is not None
+        else max(0.0, alert_time - (zone_ms / 1000.0))
+    )
+    raw_track_start = row["track_start_time"] if "track_start_time" in keys else None
+    track_start_time = (
+        float(raw_track_start)
+        if raw_track_start is not None
+        else max(0.0, confirmed_time - (conf_ms / 1000.0))
+    )
+    raw_first_det = (
+        row["first_detected_time"] if "first_detected_time" in keys else None
+    )
     first_detected_time = (
-        float(raw_first)
-        if raw_first is not None
-        else max(0.0, alert_time - (conf_ms / 1000.0))
+        float(raw_first_det)
+        if raw_first_det is not None
+        else max(0.0, track_start_time - (tracking_ms / 1000.0))
+    )
+    raw_first_vis = row["first_visible_time"] if "first_visible_time" in keys else None
+    first_visible_time = (
+        float(raw_first_vis)
+        if raw_first_vis is not None
+        else max(0.0, first_detected_time - (disc_ms / 1000.0))
+    )
+    raw_sl_req = (
+        row["secondlook_request_time"] if "secondlook_request_time" in keys else None
+    )
+    raw_sl_ans = (
+        row["secondlook_answer_time"] if "secondlook_answer_time" in keys else None
+    )
+    rn_status = (
+        str(row["reverse_norfair_status"])
+        if "reverse_norfair_status" in keys and row["reverse_norfair_status"]
+        else "pending"
     )
     return {
         "review_id": row["review_id"],
         "camera": row["camera"],
         "severity": severity,
         "alert_time": alert_time,
+        "first_visible_time": first_visible_time,
         "first_detected_time": first_detected_time,
-        "discovery_ms": float(row["discovery_ms"]),
-        "resource_busy_ms": float(row["resource_busy_ms"]),
+        "track_start_time": track_start_time,
+        "confirmed_time": confirmed_time,
+        "secondlook_request_time": (
+            float(raw_sl_req) if raw_sl_req is not None else None
+        ),
+        "secondlook_answer_time": (
+            float(raw_sl_ans) if raw_sl_ans is not None else None
+        ),
+        "discovery_ms": disc_ms,
+        "tracking_ms": tracking_ms,
+        "resource_busy_ms": busy_ms,
         "confirmation_ms": conf_ms,
+        "zone_delay_ms": zone_ms,
+        "pipeline_lag_ms": lag_ms,
         "total_ms": float(row["total_ms"]),
+        "reverse_norfair_status": rn_status,
     }
 
 
@@ -161,22 +234,20 @@ class ReviewTrustStore:
                 for row in conn.execute("PRAGMA table_info(alert_timings)").fetchall()
             }
             migrated = False
-            if "severity" not in cols:
-                conn.execute(
-                    "ALTER TABLE alert_timings ADD COLUMN severity TEXT NOT NULL DEFAULT 'alert'"
-                )
-                migrated = True
-            if "first_detected_time" not in cols:
-                conn.execute(
-                    "ALTER TABLE alert_timings ADD COLUMN first_detected_time REAL"
-                )
-                migrated = True
+            for col_name, col_def in _ALERT_TIMINGS_MIGRATIONS:
+                if col_name not in cols:
+                    conn.execute(
+                        f"ALTER TABLE alert_timings ADD COLUMN {col_name} {col_def}"
+                    )
+                    migrated = True
             if migrated:
                 conn.commit()
 
     def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.db_path, check_same_thread=False)
+        conn = sqlite3.connect(self.db_path, timeout=15.0, check_same_thread=False)
         conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
         return conn
 
     # ---- Human Feedback -----------------------------------------------------
@@ -316,50 +387,143 @@ class ReviewTrustStore:
         confirmation_ms: float = 0.0,
         total_ms: float | None = None,
         severity: str = "alert",
+        first_visible_time: float | None = None,
         first_detected_time: float | None = None,
+        track_start_time: float | None = None,
+        confirmed_time: float | None = None,
+        secondlook_request_time: float | None = None,
+        secondlook_answer_time: float | None = None,
+        tracking_ms: float | None = None,
+        zone_delay_ms: float = 0.0,
+        pipeline_lag_ms: float = 0.0,
+        reverse_norfair_status: str = "pending",
     ) -> dict[str, Any]:
-        """Record latency breakdown for a newly created alert or detection segment."""
-        sev = "detection" if severity == "detection" else "alert"
-        disc = max(0.0, float(discovery_ms))
-        busy = max(0.0, float(resource_busy_ms))
-        conf = 0.0 if sev == "detection" else max(0.0, float(confirmation_ms))
-        total = (
-            max(0.0, float(total_ms)) if total_ms is not None else disc + busy + conf
+        """Record pure timestamp-difference latency breakdown for a segment or suppressed FP."""
+        sev = (
+            severity
+            if severity in ("alert", "detection", "suppressed_fp")
+            else "alert"
         )
-        if sev == "detection":
-            total = disc + busy
-        resolved_first = (
+        disc = max(0.0, float(discovery_ms))
+        trk = (
+            max(0.0, float(tracking_ms))
+            if tracking_ms is not None
+            else 0.0
+        )
+        busy = max(0.0, float(resource_busy_ms))
+        conf = max(0.0, float(confirmation_ms))
+        zone = 0.0 if sev != "alert" else max(0.0, float(zone_delay_ms))
+        lag = max(0.0, float(pipeline_lag_ms))
+
+        alert_ts = float(alert_time)
+        resolved_confirmed = (
+            float(confirmed_time)
+            if confirmed_time is not None
+            else max(0.0, alert_ts - (zone / 1000.0))
+        )
+        resolved_track_start = (
+            float(track_start_time)
+            if track_start_time is not None
+            else max(0.0, resolved_confirmed - (conf / 1000.0))
+        )
+        resolved_first_det = (
             float(first_detected_time)
             if first_detected_time is not None
-            else max(0.0, float(alert_time) - (conf / 1000.0))
+            else max(0.0, resolved_track_start - (trk / 1000.0))
         )
+        resolved_first_vis = (
+            float(first_visible_time)
+            if first_visible_time is not None
+            else max(0.0, resolved_first_det - (disc / 1000.0))
+        )
+        # Recompute pure telescoping total from consecutive stage delays:
+        # discovery (t1 - t0) + tracking (t2 - t1) + confirmation (t4 - t2) + zone (t5 - t4)
+        # If caller explicitly passed legacy resource_busy_ms without tracking_ms/total_ms,
+        # keep backward-compatible total calculation.
+        if total_ms is not None:
+            total = max(0.0, float(total_ms))
+        elif tracking_ms is not None:
+            total = disc + trk + conf + zone
+        else:
+            total = disc + busy + conf + zone
+
         with self._lock, self._connect() as conn:
             conn.execute(
                 """
                     INSERT INTO alert_timings (
-                        review_id, camera, severity, alert_time, first_detected_time,
-                        discovery_ms, resource_busy_ms, confirmation_ms, total_ms
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        review_id, camera, severity, alert_time,
+                        first_visible_time, first_detected_time,
+                        track_start_time, confirmed_time,
+                        secondlook_request_time, secondlook_answer_time,
+                        discovery_ms, tracking_ms, resource_busy_ms,
+                        confirmation_ms, zone_delay_ms, pipeline_lag_ms,
+                        total_ms, reverse_norfair_status
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(review_id) DO UPDATE SET
                         camera = excluded.camera,
                         severity = excluded.severity,
                         alert_time = excluded.alert_time,
+                        first_visible_time = COALESCE(
+                            CASE
+                                WHEN alert_timings.reverse_norfair_status = 'done'
+                                THEN alert_timings.first_visible_time
+                                ELSE excluded.first_visible_time
+                            END,
+                            excluded.first_visible_time
+                        ),
                         first_detected_time = excluded.first_detected_time,
-                        discovery_ms = excluded.discovery_ms,
+                        track_start_time = excluded.track_start_time,
+                        confirmed_time = excluded.confirmed_time,
+                        secondlook_request_time = excluded.secondlook_request_time,
+                        secondlook_answer_time = excluded.secondlook_answer_time,
+                        discovery_ms = CASE
+                            WHEN alert_timings.reverse_norfair_status = 'done'
+                            THEN alert_timings.discovery_ms
+                            ELSE excluded.discovery_ms
+                        END,
+                        tracking_ms = excluded.tracking_ms,
                         resource_busy_ms = excluded.resource_busy_ms,
                         confirmation_ms = excluded.confirmation_ms,
-                        total_ms = excluded.total_ms
+                        zone_delay_ms = excluded.zone_delay_ms,
+                        pipeline_lag_ms = excluded.pipeline_lag_ms,
+                        total_ms = CASE
+                            WHEN alert_timings.reverse_norfair_status = 'done'
+                            THEN alert_timings.discovery_ms + excluded.tracking_ms + excluded.confirmation_ms + excluded.zone_delay_ms
+                            ELSE excluded.total_ms
+                        END,
+                        reverse_norfair_status = CASE
+                            WHEN alert_timings.reverse_norfair_status = 'done'
+                            THEN 'done'
+                            ELSE excluded.reverse_norfair_status
+                        END
                     """,
                 (
                     review_id,
                     camera,
                     sev,
-                    float(alert_time),
-                    resolved_first,
+                    alert_ts,
+                    resolved_first_vis,
+                    resolved_first_det,
+                    resolved_track_start,
+                    resolved_confirmed,
+                    (
+                        float(secondlook_request_time)
+                        if secondlook_request_time is not None
+                        else None
+                    ),
+                    (
+                        float(secondlook_answer_time)
+                        if secondlook_answer_time is not None
+                        else None
+                    ),
                     disc,
+                    trk,
                     busy,
                     conf,
+                    zone,
+                    lag,
                     total,
+                    reverse_norfair_status,
                 ),
             )
             conn.commit()
@@ -369,6 +533,46 @@ class ReviewTrustStore:
             ).fetchone()
         assert row is not None
         return _timing_row_to_dict(row)
+
+    def update_discovery_timing(
+        self,
+        review_id: str,
+        *,
+        first_visible_time: float,
+        discovery_ms: float,
+        status: str = "done",
+    ) -> dict[str, Any] | None:
+        """Update Reverse Norfair discovery result on an existing timing row."""
+        disc = max(0.0, float(discovery_ms))
+        vis = float(first_visible_time)
+        with self._lock, self._connect() as conn:
+            existing = conn.execute(
+                "SELECT * FROM alert_timings WHERE review_id = ?",
+                (review_id,),
+            ).fetchone()
+            if existing is None:
+                return None
+            trk = float(existing["tracking_ms"])
+            conf = float(existing["confirmation_ms"])
+            zone = float(existing["zone_delay_ms"])
+            new_total = disc + trk + conf + zone
+            conn.execute(
+                """
+                UPDATE alert_timings
+                SET first_visible_time = ?,
+                    discovery_ms = ?,
+                    total_ms = ?,
+                    reverse_norfair_status = ?
+                WHERE review_id = ?
+                """,
+                (vis, disc, new_total, status, review_id),
+            )
+            conn.commit()
+            row = conn.execute(
+                "SELECT * FROM alert_timings WHERE review_id = ?",
+                (review_id,),
+            ).fetchone()
+        return _timing_row_to_dict(row) if row else None
 
     def get_timing_for_review(self, review_id: str) -> dict[str, Any] | None:
         """Fetch a single timing row by review_id, or None if not recorded."""

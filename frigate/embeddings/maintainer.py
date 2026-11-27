@@ -725,6 +725,25 @@ class EmbeddingMaintainer(threading.Thread):
             if review_updates == None:
                 break
 
+            if (
+                isinstance(review_updates, dict)
+                and review_updates.get("type") == "new"
+            ):
+                after = review_updates.get("after") or {}
+                rev_id = after.get("id")
+                cam = after.get("camera")
+                sev = after.get("severity")
+                data = after.get("data") or {}
+                det_ids = data.get("detections") or []
+                if rev_id and cam and sev in ("alert", "detection") and det_ids:
+                    for rt_proc in self.realtime_processors:
+                        if isinstance(rt_proc, SecondlookProcessor):
+                            rt_proc.schedule_reverse_norfair(
+                                str(rev_id),
+                                str(cam),
+                                [str(d) for d in det_ids],
+                            )
+
             for processor in self.post_processors:
                 if isinstance(processor, ReviewDescriptionProcessor):
                     processor.process_data(review_updates, PostProcessDataEnum.review)
@@ -815,10 +834,12 @@ class EmbeddingMaintainer(threading.Thread):
                 )
 
             if secondlook_enabled and isinstance(processor, SecondlookProcessor):
+                processor.record_frame(camera, float(frame_time), yuv_frame)
                 for obj in tracked_objects or []:
                     # Only objects present on this frame (real hits / current box)
                     if obj.get("frame_time") != frame_time:
                         continue
+                    processor.record_track_seed(obj)
                     processor.process_frame(obj, yuv_frame)
 
         self.frame_manager.close(frame_name)

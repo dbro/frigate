@@ -190,6 +190,48 @@ export default function SuppressedFpCard({
                   </div>
                 )}
               </div>
+              {item.timing && (
+                <div className="border-t border-border pt-1.5 text-[11px]">
+                  <div className="mb-1 text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">
+                    Suppression Timing
+                  </div>
+                  <div className="space-y-0.5">
+                    <div className="flex justify-between gap-2">
+                      <span className="inline-flex items-center gap-1.5 text-muted-foreground">
+                        <span className="size-2 rounded-sm bg-slate-400" />
+                        Discovery
+                      </span>
+                      <span className="font-mono">
+                        {(item.timing.discovery_ms / 1000).toFixed(2)}s
+                      </span>
+                    </div>
+                    <div className="flex justify-between gap-2">
+                      <span className="inline-flex items-center gap-1.5 text-amber-600 dark:text-amber-400">
+                        <span className="size-2 rounded-sm bg-amber-500" />
+                        Tracking
+                      </span>
+                      <span className="font-mono">
+                        {((item.timing.tracking_ms ?? 0) / 1000).toFixed(2)}s
+                      </span>
+                    </div>
+                    <div className="flex justify-between gap-2">
+                      <span className="inline-flex items-center gap-1.5 text-violet-600 dark:text-violet-400">
+                        <span className="size-2 rounded-sm bg-violet-500" />
+                        Confirmation (SL)
+                      </span>
+                      <span className="font-mono">
+                        {(item.timing.confirmation_ms / 1000).toFixed(2)}s
+                      </span>
+                    </div>
+                    <div className="mt-0.5 flex justify-between gap-2 border-t border-border/60 pt-0.5 font-semibold">
+                      <span>Total</span>
+                      <span className="font-mono">
+                        {(item.timing.total_ms / 1000).toFixed(2)}s
+                      </span>
+                    </div>
+                  </div>
+                </div>
+              )}
             </div>
           </TooltipContent>
         </Tooltip>
